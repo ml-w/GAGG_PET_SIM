@@ -322,6 +322,207 @@ class GATEEventProcessor:
 
 
 # ==============================================================================
+# DETECTOR CAMERA VIEW VISUALIZATION
+# ==============================================================================
+
+class DetectorCameraView:
+    """Visualize PET events as detector camera views."""
+
+    def __init__(self, data_source, verbose=True):
+        """
+        Initialize with event data.
+
+        Args:
+            data_source: Either:
+                - Dictionary with listmode data (x1, y1, z1, x2, y2, z2, etc.)
+                - GATEEventProcessor instance (direct access, more efficient)
+            verbose: Enable verbose output
+        """
+        self.verbose = verbose
+
+        # Support both direct processor access and listmode dictionary
+        if isinstance(data_source, GATEEventProcessor):
+            # Direct access - no intermediate conversion (efficient)
+            self._init_from_processor(data_source)
+        else:
+            # Listmode dictionary - for standalone use or loaded files
+            self._init_from_listmode(data_source)
+
+        self._analyze_geometry()
+
+    def _init_from_processor(self, processor):
+        """Initialize directly from GATEEventProcessor (efficient)."""
+        if processor.coincidences is None:
+            raise ValueError("No coincidences detected in processor")
+
+        idx1 = processor.coincidences[:, 0]
+        idx2 = processor.coincidences[:, 1]
+
+        # Direct extraction - skips intermediate listmode creation
+        self.detector1 = {
+            'x': processor.hits_data['position_x'][idx1],
+            'y': processor.hits_data['position_y'][idx1],
+            'z': processor.hits_data['position_z'][idx1],
+            'energy': processor.hits_data['energy'][idx1],
+            'time': processor.hits_data['time'][idx1]
+        }
+        self.detector2 = {
+            'x': processor.hits_data['position_x'][idx2],
+            'y': processor.hits_data['position_y'][idx2],
+            'z': processor.hits_data['position_z'][idx2],
+            'energy': processor.hits_data['energy'][idx2],
+            'time': processor.hits_data['time'][idx2]
+        }
+
+    def _init_from_listmode(self, listmode_data):
+        """Initialize from listmode dictionary (for standalone/file loading)."""
+        self.detector1 = {
+            'x': listmode_data['x1'],
+            'y': listmode_data['y1'],
+            'z': listmode_data['z1'],
+            'energy': listmode_data['energy1'],
+            'time': listmode_data['time1']
+        }
+        self.detector2 = {
+            'x': listmode_data['x2'],
+            'y': listmode_data['y2'],
+            'z': listmode_data['z2'],
+            'energy': listmode_data['energy2'],
+            'time': listmode_data['time2']
+        }
+
+    def log(self, message):
+        """Print message if verbose enabled."""
+        if self.verbose:
+            click.echo(message)
+
+    def _analyze_geometry(self):
+        """Analyze detector positions to determine orientation."""
+        det1_mean = np.array([
+            np.mean(self.detector1['x']),
+            np.mean(self.detector1['y']),
+            np.mean(self.detector1['z'])
+        ])
+        det2_mean = np.array([
+            np.mean(self.detector2['x']),
+            np.mean(self.detector2['y']),
+            np.mean(self.detector2['z'])
+        ])
+
+        if self.verbose:
+            self.log(f"  Panel 1 center: ({det1_mean[0]:.1f}, {det1_mean[1]:.1f}, {det1_mean[2]:.1f}) mm")
+            self.log(f"  Panel 2 center: ({det2_mean[0]:.1f}, {det2_mean[1]:.1f}, {det2_mean[2]:.1f}) mm")
+
+        # Determine separation axis
+        separation = np.abs(det2_mean - det1_mean)
+        self.separation_axis = np.argmax(separation)
+        axis_names = ['X', 'Y', 'Z']
+
+        if self.verbose:
+            self.log(f"  Separation axis: {axis_names[self.separation_axis]}")
+            self.log(f"  Panel distance: {separation[self.separation_axis]:.1f} mm")
+
+    def create_camera_views(self, output_path, bins=50, colormap='viridis', log_scale=False):
+        """Create detector camera view visualization."""
+        fig = plt.figure(figsize=(16, 12))
+
+        # Determine coordinates based on separation axis
+        if self.separation_axis == 0:  # Separated in X
+            coord1_name, coord2_name = 'Y', 'Z'
+            det1_u, det1_v = self.detector1['y'], self.detector1['z']
+            det2_u, det2_v = self.detector2['y'], self.detector2['z']
+        elif self.separation_axis == 1:  # Separated in Y
+            coord1_name, coord2_name = 'X', 'Z'
+            det1_u, det1_v = self.detector1['x'], self.detector1['z']
+            det2_u, det2_v = self.detector2['x'], self.detector2['z']
+        else:  # Separated in Z
+            coord1_name, coord2_name = 'X', 'Y'
+            det1_u, det1_v = self.detector1['x'], self.detector1['y']
+            det2_u, det2_v = self.detector2['x'], self.detector2['y']
+
+        from matplotlib.colors import LogNorm
+        norm = LogNorm() if log_scale else None
+
+        # Panel 1 camera view
+        ax1 = plt.subplot(2, 3, 1)
+        _, _, _, im1 = ax1.hist2d(det1_u, det1_v, bins=bins, cmap=colormap, norm=norm)
+        ax1.set_xlabel(f'{coord1_name} position (mm)')
+        ax1.set_ylabel(f'{coord2_name} position (mm)')
+        ax1.set_title('Detector Panel 1 - Camera View', fontweight='bold')
+        ax1.set_aspect('equal')
+        plt.colorbar(im1, ax=ax1, label='Hit counts')
+
+        # Panel 2 camera view
+        ax2 = plt.subplot(2, 3, 2)
+        _, _, _, im2 = ax2.hist2d(det2_u, det2_v, bins=bins, cmap=colormap, norm=norm)
+        ax2.set_xlabel(f'{coord1_name} position (mm)')
+        ax2.set_ylabel(f'{coord2_name} position (mm)')
+        ax2.set_title('Detector Panel 2 - Camera View', fontweight='bold')
+        ax2.set_aspect('equal')
+        plt.colorbar(im2, ax=ax2, label='Hit counts')
+
+        # Combined view
+        ax3 = plt.subplot(2, 3, 3)
+        ax3.hist2d(det1_u, det1_v, bins=bins, cmap='Reds', alpha=0.5)
+        ax3.hist2d(det2_u, det2_v, bins=bins, cmap='Blues', alpha=0.5)
+        ax3.set_xlabel(f'{coord1_name} position (mm)')
+        ax3.set_ylabel(f'{coord2_name} position (mm)')
+        ax3.set_title('Combined (Red: Panel 1, Blue: Panel 2)', fontweight='bold')
+        ax3.set_aspect('equal')
+
+        # Energy-weighted Panel 1
+        ax4 = plt.subplot(2, 3, 4)
+        _, _, _, im4 = ax4.hist2d(det1_u, det1_v, bins=bins,
+                                  weights=self.detector1['energy'],
+                                  cmap=colormap, norm=norm)
+        ax4.set_xlabel(f'{coord1_name} position (mm)')
+        ax4.set_ylabel(f'{coord2_name} position (mm)')
+        ax4.set_title('Panel 1 - Energy Weighted', fontweight='bold')
+        ax4.set_aspect('equal')
+        plt.colorbar(im4, ax=ax4, label='Total energy (keV)')
+
+        # Energy-weighted Panel 2
+        ax5 = plt.subplot(2, 3, 5)
+        _, _, _, im5 = ax5.hist2d(det2_u, det2_v, bins=bins,
+                                  weights=self.detector2['energy'],
+                                  cmap=colormap, norm=norm)
+        ax5.set_xlabel(f'{coord1_name} position (mm)')
+        ax5.set_ylabel(f'{coord2_name} position (mm)')
+        ax5.set_title('Panel 2 - Energy Weighted', fontweight='bold')
+        ax5.set_aspect('equal')
+        plt.colorbar(im5, ax=ax5, label='Total energy (keV)')
+
+        # LOR projection
+        ax6 = plt.subplot(2, 3, 6)
+        n_lors = min(1000, len(det1_u))
+        sample_idx = np.random.choice(len(det1_u), n_lors, replace=False)
+
+        for idx in sample_idx:
+            ax6.plot([det1_u[idx], det2_u[idx]],
+                    [det1_v[idx], det2_v[idx]],
+                    'b-', alpha=0.02, linewidth=0.5)
+
+        ax6.scatter(det1_u[sample_idx], det1_v[sample_idx],
+                   c='red', s=10, alpha=0.3, label='Panel 1')
+        ax6.scatter(det2_u[sample_idx], det2_v[sample_idx],
+                   c='blue', s=10, alpha=0.3, label='Panel 2')
+
+        ax6.set_xlabel(f'{coord1_name} position (mm)')
+        ax6.set_ylabel(f'{coord2_name} position (mm)')
+        ax6.set_title(f'Lines of Response ({n_lors} samples)', fontweight='bold')
+        ax6.set_aspect('equal')
+        ax6.legend()
+        ax6.grid(True, alpha=0.3)
+
+        plt.suptitle('PET Detector Camera Views', fontsize=16, fontweight='bold')
+        plt.tight_layout()
+        plt.savefig(output_path, dpi=150, bbox_inches='tight')
+        plt.close()
+
+        self.log(f"  ✓ {output_path.name}")
+
+
+# ==============================================================================
 # CLI INTERFACE
 # ==============================================================================
 
@@ -342,10 +543,19 @@ from trogon import tui
               help='ROOT tree name (default: Hits)')
 @click.option('--plot/--no-plot', default=True,
               help='Generate statistics plots')
+@click.option('--camera-view/--no-camera-view', default=True,
+              help='Generate detector camera view visualization')
+@click.option('--camera-bins', default=50,
+              help='Histogram bins for camera views (default: 50)')
+@click.option('--camera-colormap', default='viridis',
+              help='Colormap for camera views (default: viridis)')
+@click.option('--camera-log-scale/--camera-linear-scale', default=False,
+              help='Use logarithmic color scale for camera views')
 @click.option('--verbose/--quiet', '-v/-q', default=True,
               help='Verbose output')
 def process_events(input_root, output_dir, time_window, energy_min, energy_max,
-                   tree_name, plot, verbose):
+                   tree_name, plot, camera_view, camera_bins, camera_colormap,
+                   camera_log_scale, verbose):
     """
     Process GATE ROOT files for PET reconstruction.
 
@@ -355,7 +565,7 @@ def process_events(input_root, output_dir, time_window, energy_min, energy_max,
     Note: ROOT files store energy in MeV, but this tool works with keV.
           Energy values are automatically converted during loading.
 
-    \b
+    
     Examples:
         # Basic processing (400-600 keV window, 10 ns coincidence)
         cli_process_events.py output/events.root
@@ -365,6 +575,15 @@ def process_events(input_root, output_dir, time_window, energy_min, energy_max,
 
         # Tight energy window around 511 keV photopeak
         cli_process_events.py --energy-min 480 --energy-max 540 output/events.root
+
+        # High-resolution detector camera views with hot colormap
+        cli_process_events.py --camera-bins 100 --camera-colormap hot output/events.root
+
+        # Logarithmic scale for wide dynamic range
+        cli_process_events.py --camera-log-scale output/events.root
+
+        # Skip camera views (faster processing)
+        cli_process_events.py --no-camera-view output/events.root
 
         # Specify output location
         cli_process_events.py -o results/processed output/events.root
@@ -399,12 +618,36 @@ def process_events(input_root, output_dir, time_window, energy_min, energy_max,
             click.echo("\n[3/4] Saving Processed Data")
         processor.save_processed_data(output_dir)
 
-        # Step 4: Generate plots
+        # Step 4: Generate statistics plots
+        step_num = 4
+        total_steps = 4 + (1 if camera_view else 0)
+
         if plot:
             if verbose:
-                click.echo("\n[4/4] Generating Plots")
+                click.echo(f"\n[{step_num}/{total_steps}] Generating Statistics Plots")
             plot_path = Path(output_dir) / "event_statistics.png"
             processor.plot_statistics(plot_path)
+            step_num += 1
+
+        # Step 5: Generate detector camera views
+        if camera_view:
+            if verbose:
+                click.echo(f"\n[{step_num}/{total_steps}] Generating Detector Camera Views")
+
+            try:
+                # Direct processor access - no intermediate listmode creation
+                # This is more efficient than: listmode = processor.create_listmode_data()
+                camera_viz = DetectorCameraView(processor, verbose=verbose)
+                camera_path = Path(output_dir) / "detector_camera_views.png"
+                camera_viz.create_camera_views(
+                    camera_path,
+                    bins=camera_bins,
+                    colormap=camera_colormap,
+                    log_scale=camera_log_scale
+                )
+            except Exception as e:
+                if verbose:
+                    click.echo(f"  ✗ Could not generate camera views: {e}")
 
         # Summary
         click.echo("\n" + "=" * 70)
@@ -416,6 +659,12 @@ def process_events(input_root, output_dir, time_window, energy_min, energy_max,
 
         output_path = Path(output_dir)
         if (output_path / "listmode_data.npz").exists():
+            click.echo(f"\nGenerated files:")
+            click.echo(f"  • listmode_data.npz - List-mode event data")
+            if plot:
+                click.echo(f"  • event_statistics.png - Event statistics")
+            if camera_view and (output_path / "detector_camera_views.png").exists():
+                click.echo(f"  • detector_camera_views.png - Detector camera views")
             click.echo(f"\nNext step:")
             click.echo(f"  cli_reconstruct_pet.py {output_path / 'listmode_data.npz'}")
 

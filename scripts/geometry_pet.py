@@ -1,6 +1,7 @@
 import opengate as gate
 from opengate.contrib.pet import *
 
+import click
 import math, scipy
 import numpy as np
 from opengate.sources.base import SourceBase
@@ -9,6 +10,7 @@ from opengate.actors.digitizers import *
 from opengate.geometry.utility import get_grid_repetition, get_circular_repetition
 from opengate.sources.utility import get_spectrum
 from scipy.spatial.transform import Rotation
+from phantom_derenzo import add_derenzo_phantom, add_sources as derenzo_add_source
 import pathlib
 
 
@@ -61,7 +63,7 @@ class PETGeometry():
             self._nx = 50
             self._ny = 50
         self._housing_size = [
-            CRYSTAL_THICKNESS,
+            CRYSTAL_THICKNESS, 
             self._nx * CRYSTAL_SIZE_X + (self._nx - 1) * DETECTOR_SPACING,
             self._ny * CRYSTAL_SIZE_Y + (self._ny - 1) * DETECTOR_SPACING,
         ]
@@ -84,7 +86,7 @@ class PETGeometry():
         panel.size = self._housing_size
         panel.color = [0.5, 0.5, 0.5, 1]  # grey
         trans, rot = get_circular_repetition(
-            2, [FOV_RADIUS * 1.3, 0, 0], start_angle_deg = 0, axis=[0, 0, 1]
+            8, [FOV_RADIUS * 1.4, 0, 0], start_angle_deg = 0, axis=[0, 0, 1]
         )
         panel.translation = trans
         panel.rotation = rot
@@ -102,6 +104,58 @@ class PETGeometry():
         
         self._panel = panel
         self._crystals = pixelized_crystals
+        
+    def save_geom(self, output_path: str = "../output/detector_geometry.json") -> None:
+        """
+        Save detector geometry configuration to JSON file.
+
+        This file can be loaded by visualization and reconstruction tools to
+        automatically determine the correct bin sizes and spatial parameters.
+
+        Args:
+            output_path: Path to save geometry JSON file
+        """
+        import json
+        from pathlib import Path
+
+        # Calculate detector face dimensions
+        detector_width = self._nx * CRYSTAL_SIZE_X + (self._nx - 1) * DETECTOR_SPACING
+        detector_height = self._ny * CRYSTAL_SIZE_Y + (self._ny - 1) * DETECTOR_SPACING
+
+        config = {
+            'detector_type': 'dual_panel_pet',
+            'crystal_array': {
+                'nx': self._nx,
+                'ny': self._ny,
+                'total_crystals': self._nx * self._ny
+            },
+            'crystal_dimensions': {
+                'size_x_mm': float(CRYSTAL_SIZE_X),
+                'size_y_mm': float(CRYSTAL_SIZE_Y),
+                'thickness_mm': float(CRYSTAL_THICKNESS),
+                'spacing_mm': float(DETECTOR_SPACING)
+            },
+            'detector_face': {
+                'width_mm': float(detector_width),
+                'height_mm': float(detector_height)
+            },
+            'housing': {
+                'size_mm': [float(s) for s in self._housing_size]
+            },
+            'field_of_view': {
+                'radius_mm': float(FOV_RADIUS)
+            },
+            'output_file': self._output_filename
+        }
+
+        output_file = Path(output_path)
+        output_file.parent.mkdir(parents=True, exist_ok=True)
+
+        with open(output_file, 'w') as f:
+            json.dump(config, f, indent=2)
+
+        print(f"Saved detector geometry to: {output_file}")
+        return str(output_file)
         
     def add_digitizer(self) -> None:
         """
@@ -140,6 +194,7 @@ class PETGeometry():
         energy_filter.channels = [
             {"min": 400 * keV, "max": 650 * keV, "name": "scatter"}  # 只接受 511 keV 附近
         ]
+        energy_filter.output_filename = hc.output_filename
 
         return hc, sc
         
@@ -218,149 +273,95 @@ class PETGeometry():
 
         return self._phantom
 
-    def add_derenzo_phantom(self, rod_pattern="micro", activity_concentration=1.0 * MBq / cm**3):
+    def add_derenzo_phantom(self):
         """
         Add Derenzo (Hot Rod) phantom for spatial resolution testing.
 
+        Uses the external phantom_derenzo module for accurate geometry.
+
         Args:
-            rod_pattern: "micro" for small rods (1.0-4.0mm) or "clinical" for larger (3.5-6.0mm)
-            activity_concentration: Activity concentration in rods (default 1 MBq/cm³)
+            scale_factor: Scaling factor for phantom dimensions (default 1.0)
+                         - 1.0: Clinical PET (5.0-14.5 mm rods)
+                         - 0.5: Small animal PET (2.5-7.3 mm rods)
+                         - 0.3: Micro-PET (1.5-4.4 mm rods)
 
         Returns:
-            Dictionary with phantom volumes
+            Phantom body volume object
         """
+        from phantom_derenzo import add_derenzo_phantom
+
         sim = self._sim
 
-        # Select rod diameters based on pattern type
-        if rod_pattern == "micro":
-            rod_diameters = [1.0, 1.5, 2.0, 2.5, 3.0, 4.0]  # mm - micro-PET
-        else:  # clinical
-            rod_diameters = [3.5, 4.0, 4.5, 5.0, 5.5, 6.0]  # mm - clinical
+        # Create phantom using external module
+        phantom_body = add_derenzo_phantom(sim, name="derenzo", scale_factor=0.33333)
 
-        # Main phantom body
-        phantom_radius = 6 * cm
-        phantom_height = 4 * cm
-
-        phantom_body = sim.add_volume("Cylinder", "Derenzo_Body")
-        phantom_body.rmax = phantom_radius
-        phantom_body.dz = phantom_height / 2  # Half height for GATE
-        phantom_body.material = "G4_WATER"
-        phantom_body.color = [0, 0, 1, 0.1]  # Blue transparent
-
-        rod_volumes = []
-
-        # Create 6 wedge sectors with different rod sizes
-        for sector_idx, rod_diameter in enumerate(rod_diameters):
-            # Each sector spans 60 degrees
-            sector_angle_start = sector_idx * 60
-            sector_angle_end = (sector_idx + 1) * 60
-
-            # Rod spacing: center-to-center distance = 2 * diameter
-            rod_spacing = 2 * rod_diameter * mm
-
-            # Create rods in triangular/hexagonal pattern within sector
-            # Number of rods depends on available space
-            max_radius = phantom_radius - 1 * cm  # Keep away from edge
-
-            # Generate rod positions in sector
-            for ring in range(1, 6):  # Multiple rings of rods
-                ring_radius = ring * rod_spacing
-                if ring_radius > max_radius:
-                    break
-
-                # Number of rods in this ring for this sector
-                n_rods = max(2, int(60 / (360 / (2 * np.pi * ring_radius / rod_spacing))))
-
-                for rod_idx in range(n_rods):
-                    # Calculate angle within sector
-                    angle = sector_angle_start + rod_idx * 60 / max(n_rods - 1, 1)
-
-                    # Skip if outside sector boundaries
-                    if angle > sector_angle_end:
-                        continue
-
-                    angle_rad = angle * deg
-                    x = ring_radius * np.cos(angle_rad)
-                    y = ring_radius * np.sin(angle_rad)
-
-                    # Create rod
-                    rod = sim.add_volume("Cylinder",
-                                        f"Derenzo_Rod_S{sector_idx}_R{ring}_N{rod_idx}")
-                    rod.rmax = rod_diameter * mm / 2
-                    rod.dz = phantom_height / 2
-                    rod.material = "G4_WATER"
-                    rod.mother = phantom_body.name
-                    rod.translation = [x, y, 0]
-                    rod.color = [1, 0, 0, 0.5]  # Red semi-transparent
-
-                    rod_volumes.append(rod)
-
+        # Store phantom reference
         self._phantom = {
             "type": "Derenzo",
-            "pattern": rod_pattern,
             "body": phantom_body,
-            "rods": rod_volumes
+            "name": phantom_body.name
         }
 
-        return self._phantom
+        return phantom_body
 
     # ==========================================================================
     # SOURCE METHODS
     # ==========================================================================
 
-    def add_phantom_source(self, activity=10 * MBq, isotope="F18")  :
+    def add_phantom_source(self, activity=10 * MBq, isotope="F18", activity_Bq_mL=None):
         """
         Add radioactive source to the phantom (for NEMA or Derenzo).
 
         Args:
-            activity: Total activity in phantom (default 10 MBq)
-            isotope: Isotope name - "F18", "C11", "Ga68", etc.
+            activity: Total activity in phantom (default 10 MBq) - used for NEMA phantom
+            isotope: Isotope name - "F18", "C11", "Ga68", "Tc99m"
+            activity_Bq_mL: List of activity concentrations (Bq/mL) for each Derenzo sector
+                           If None, equal activity is assigned to all sectors
+                           Example: [1e6, 1e6, 1e6, 1e6, 1e6, 1e6]
 
         Returns:
-            Source object
+            Source object (NEMA) or list of source objects (Derenzo)
         """
         sim = self._sim
 
         if self._phantom is None:
             raise ValueError("No phantom created. Call add_nema_iq_phantom() or add_derenzo_phantom() first.")
 
-        # Create generic source
-        source = sim.add_source("GenericSource", f"{self._phantom['type']}_Source")
-        source.particle = "e+"  # Positron
+        # Handle Derenzo phantom separately using external module
+        sources = []
+        if self._phantom['type'] == "Derenzo":
+            from phantom_derenzo import add_sources
 
-        # Set isotope-specific properties
-        if isotope == "F18":
-            source.energy.type = "F18"
-            source.half_life = 109.77 * 60  # seconds (109.77 min)
-        elif isotope == "C11":
-            source.energy.type = "C11"
-            source.half_life = 20.38 * 60  # seconds
-        elif isotope == "Ga68":
-            source.energy.type = "Ga68"
-            source.half_life = 67.71 * 60  # seconds
+            # Default equal activity for all 6 sectors if not specified
+            if activity_Bq_mL is None:
+                activity_Bq_mL = [1e6 * Bq, 1e6 * Bq, 1e6 * Bq,  1e6 * Bq, 1e6 * Bq, 1e6 * Bq]
+
+            # Use external add_sources function
+            phantom_body = self._phantom['body']
+            sources.extend(derenzo_add_source(sim, phantom_body, activity_Bq_mL))
         else:
-            # Default to mono-energetic positron
-            source.energy.type = "mono"
-            source.energy.mono = 511 * keV
-
-        source.activity = activity
-
-        # Attach to phantom volume
-        if self._phantom['type'] == "NEMA_IQ":
-            # For NEMA, source in spheres
-            source.position.type = "sphere"
-            source.position.radius = self._phantom['spheres'][0].rmax
-            source.position.translation = [0, 0, 0]
-        else:  # Derenzo
-            # For Derenzo, source in rods
-            source.position.type = "cylinder"
-            source.position.radius = self._phantom['body'].rmax - 1 * cm
-            source.position.dz = self._phantom['body'].dz
-
-        source.direction.type = "iso"
-
-        self._sources.append(source)
-        return source
+            # NEMA phantom - original implementation
+            source = sim.add_source("GenericSource", f"{self._phantom['type']}_Source")
+            for source in sources:
+                # Set isotope-specific properties
+                if isotope == "F18":
+                    source.energy.type = "F18"
+                    source.half_life = 109.77 * 60  # seconds (109.77 min)
+                elif isotope == "C11":
+                    source.energy.type = "C11"
+                    source.half_life = 20.38 * 60  # seconds
+                elif isotope == "Ga68":
+                    source.energy.type = "Ga68"
+                    source.half_life = 67.71 * 60  # seconds
+                else:
+                    # Default to mono-energetic positron
+                    source.energy.type = "mono"
+                    source.energy.mono = 511 * keV
+                    
+                source.particle = "e+"  # Positron
+                source.activity = activity
+                self._sources.append(source)
+            return source
 
     def add_ring_source(self, 
                         pos: list[float] = [0., 0., 0.], 
@@ -380,6 +381,15 @@ class PETGeometry():
             Source object
         """
         sim = self._sim
+
+        # Fill FOV with water to promote enihlation events
+        FOV = sim.add_volume("Tubs", "FOV")
+        FOV.mother = sim.world.name
+        FOV.material = "Water"
+        FOV.rmax = FOV_RADIUS
+        FOV.rmin = 0
+        FOV.dz = WORLD_DEPTH * 0.5
+        FOV.color = [0.8, 1, 0.2, 0.1]
 
         # Create ring source using tube geometry
         source = sim.add_source("GenericSource", "Ring_Source")
@@ -494,7 +504,15 @@ class PETGeometry():
         return sim.physics_manager
         
 
-if __name__ == "__main__":
+@click.command()
+@click.option('--visu', is_flag=True, help="Turn on visualization. This turns off multi-thread and reduce sim time.", 
+              default=False)
+@click.option('--sim-time', type=float, help="Seconds to simulate. Default to 0.0001 sec", 
+              default=0.0001)
+@click.option('--output', type=str, help="Output file directory.", default="./output")
+@click.option('--scenario', type=click.Choice(['NEMA', 'Derenzo', 'Ring', 'Point'], case_sensitive=False), 
+              help="Simulation scenario to run. Default to 'Ring'.", default="Ring")
+def main(visu, sim_time, output, scenario):
     """
     Example usage scenarios for PET simulation.
 
@@ -502,14 +520,12 @@ if __name__ == "__main__":
     1. NEMA IQ Phantom with F-18 source
     2. Derenzo Phantom for spatial resolution testing
     3. Ring source configuration (for rotating detector simulation)
-    4. Point source for calibration
+    4. Point source for calibration+
     """
 
     # ==========================================================================
     # SCENARIO 1: NEMA IQ Phantom (Image Quality Assessment)
     # ==========================================================================
-    scenario = "Ring"  # Options: "NEMA", "Derenzo", "Ring", "Point"
-
     sim = gate.Simulation()
 
     # Basic simulation configuration
@@ -519,19 +535,14 @@ if __name__ == "__main__":
     sim.world.material = "Air"
     sim.world.color = [1, 0, 1, 1]  # invisible
 
-    # Fill FOV with water to promote enihlation events
-    FOV = sim.add_volume("Tubs", "FOV")
-    FOV.mother = sim.world.name
-    FOV.material = "Water"
-    FOV.rmax = FOV_RADIUS
-    FOV.rmin = 0
-    FOV.dz = WORLD_DEPTH * 0.5
-    FOV.color = [0.8, 1, 0.2, 0.1]
-
     # Create PET geometry
     pet = PETGeometry(sim, debug=False)  # Set debug=True for faster 5x5 array
     pet.add_pet()
     pet.add_digitizer()
+    pet._output_filename = output
+
+    # Save geometry configuration for visualization tools
+    pet.save_geom()
 
     # Configure physics
     pet.setup_physics("G4EmStandardPhysics_option4")
@@ -550,9 +561,9 @@ if __name__ == "__main__":
     elif scenario == "Derenzo":
         # Add Derenzo phantom
         print("Creating Derenzo (Hot Rod) phantom...")
-        phantom = pet.add_derenzo_phantom(rod_pattern="micro")  # or "clinical"
-        print(f"  - Created {len(phantom['rods'])} rods")
-        print(f"  - Pattern: {phantom['pattern']}")
+        phantom = pet.add_derenzo_phantom()  # or "clinical"
+        phantom.rotation=np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1]])
+        print(f"  - Created Derenzo phantom")
 
         # Add source to Derenzo phantom
         source = pet.add_phantom_source(activity=20 * MBq, isotope="F18")
@@ -561,7 +572,7 @@ if __name__ == "__main__":
     elif scenario == "Ring":
         # Ring source configuration (no phantom)
         source = pet.add_ring_source(radius=0.5 * cm, activity=150E6 * Bq, 
-                                     pos=[3 * cm, 0, 1 * cm], isotope="F18")
+                                     pos=[5 * cm, 7 * cm, -5 * cm], isotope="F18")
         pass
     elif scenario == "Point":
         # Point source for calibration
@@ -575,17 +586,24 @@ if __name__ == "__main__":
     sim.random_seed = 123456
 
     # Visualization (disable for production runs)
-    sim.visu = False
-    if sim.visu:
-        # Program will run into a deadlock if multi-threaded.
-        sim.number_of_threads = 1
+    sim.visu = visu
 
     # Run parameters (for actual simulation, not just visualization)
     # Uncomment and adjust for production:
-    sim.run_timing_intervals = [(0, 0.01 * sec)]  # 1 second acquisition
+    sim.run_timing_intervals = [(0, sim_time * sec)]  # 1 second acquisition
     # sim.number_of_events = 1e4  # Number of primary particles
+
+    if sim.visu:
+        # Program will run into a deadlock if multi-threaded.
+        sim.number_of_threads = 1
+        # sim.run_timing_intervals = [(0, .000001 * sec)]
+        sim.run_timing_intervals = [(0, .00000001 * sec)]
 
     print("\nStarting simulation...")
     print("Close visualization window to end.")
     sim.run()
     print("Simulation complete!")
+    
+    
+if __name__ == "__main__":
+    main()
