@@ -1,17 +1,28 @@
 import opengate as gate
 from opengate.contrib.pet import *
 
-import click
+import click, rich
+import uproot
 import math, scipy
 import numpy as np
+import os
 from opengate.sources.base import SourceBase
 from opengate.geometry.volumes import VolumeBase
 from opengate.actors.digitizers import *
 from opengate.geometry.utility import get_grid_repetition, get_circular_repetition
 from opengate.sources.utility import get_spectrum
+from opengate.actors.coincidences import coincidences_sorter
 from scipy.spatial.transform import Rotation
 from phantom_derenzo import add_derenzo_phantom, add_sources as derenzo_add_source
 import pathlib
+
+# Import detector ID parsing utilities
+from utils import (
+    parse_volume_ids,
+    crystal_id_to_xy,
+    add_detector_ids_to_coincidences,
+    add_detector_ids_to_reads
+)
 
 
 # ==============================================================================
@@ -40,7 +51,6 @@ CRYSTAL_THICKNESS = 19 * mm
 DETECTOR_SPACING = 0.1 * mm
 
 
-
 def add_materials(sim):
     # Use local GateMaterials.db if available, otherwise standard
     f = pathlib.Path(__file__).parent.resolve()
@@ -53,7 +63,7 @@ def add_materials(sim):
         pass
 
 class PETGeometry():
-    def __init__(self, sim: gate.Simulation, debug=False):
+    def __init__(self, sim: gate.Simulation, output_file: str, debug: bool=False):
         self._sim = sim
         # pixelized crystal
         if debug:
@@ -62,34 +72,86 @@ class PETGeometry():
         else:
             self._nx = 50
             self._ny = 50
+        
+        # Number of panels (rsectors) arranged circularly. This needs to consider FOV
+        self._n_rsectors = 8
+        
         self._housing_size = [
-            CRYSTAL_THICKNESS, 
+            CRYSTAL_THICKNESS,
             self._nx * CRYSTAL_SIZE_X + (self._nx - 1) * DETECTOR_SPACING,
             self._ny * CRYSTAL_SIZE_Y + (self._ny - 1) * DETECTOR_SPACING,
         ]
         print(f"Calculated housing size: {self._housing_size}")
 
         # output config
-        self._output_filename = "output/events.root"
+        self._output_filename = output_file
 
         # References to created objects
         self._phantom = None
         self._sources = []
         
+        self._scanner_info = {
+            # Crystal configuration
+            'crystalTransNr': self._nx,                           # 50 crystals transaxially per panel
+            'crystalAxialNr': self._ny,                           # 50 crystals axially per panel
+            'crystalTransSpacing': float(CRYSTAL_SIZE_X + DETECTOR_SPACING),  # 2.1 mm
+            'crystalAxialSpacing': float(CRYSTAL_SIZE_Y + DETECTOR_SPACING),  # 2.1 mm
+            
+            # Submodule configuration (no subdivision in your case)
+            'submoduleTransNr': 1,
+            'submoduleAxialNr': 1,
+            'submoduleTransSpacing': 0.0,
+            'submoduleAxialSpacing': 0.0,
+            
+            # Module configuration (no subdivision in your case)
+            'moduleTransNr': 1,
+            'moduleAxialNr': 1,
+            'moduleTransSpacing': 0.0,
+            'moduleAxialSpacing': 0.0,
+            
+            # Rsector configuration (8 panels arranged in octagon)
+            'rsectorTransNr': self._n_rsectors,                   # 8 panels
+            'rsectorAxialNr': 1,                                  # Single ring
+            
+            # Scanner geometry
+            'radius': float(FOV_RADIUS * 1.4),                    # Distance from center to panel face
+            'firstCrystalAxis': 0,                                # First crystal along X axis
+            
+            # Derived values
+            'NrCrystalsPerRing': self._nx * self._n_rsectors,     # 50 * 8 = 400 crystals per ring
+            'NrRings': self._ny,                                  # 50 rings (axial crystals)
+            
+            # Event filtering
+            'min_rsector_difference': 0,                          # Accept all coincidences
+            
+            # Crystal dimensions (for reference, not used by pytomography functions)
+            'crystal_length': float(CRYSTAL_THICKNESS),           # 19 mm
+            
+            # Tell that TOF is there
+            'TOF': 1
+        }
+        
+    @property
+    def scanner_info(self):
+        return self._scanner_info
+        
     def _build_detector(self):
         sim = self._sim
 
         # Housing
-        panel  = sim.add_volume("Box", name="CrystalHousing")
+        panel  = sim.add_volume("Box", name="Panel")
         panel.mother = sim.world.name
-        panel.material = "Air"
+        panel.material = "Aluminium"
         panel.size = self._housing_size
         panel.color = [0.5, 0.5, 0.5, 1]  # grey
         trans, rot = get_circular_repetition(
-            8, [FOV_RADIUS * 1.4, 0, 0], start_angle_deg = 0, axis=[0, 0, 1]
+            self._n_rsectors, [FOV_RADIUS * 1.4, 0, 0], start_angle_deg = 0, axis=[0, 0, 1]
         )
         panel.translation = trans
         panel.rotation = rot
+        for i in range(panel.number_of_repetitions):
+            print(f"Panel name: {panel.get_repetition_name_from_index(i)}")
+            
         
         # Build the panel with GAGG
         pixelized_crystals = sim.add_volume("Box", "PixelizedCrystals")
@@ -101,6 +163,7 @@ class PETGeometry():
         pixelized_crystals.material = "LYSO"
         pixelized_crystals.color = [0, 1, 0, 0.3]  # green
         pixelized_crystals.translation = trans
+        print(f"Crystal configuration: {self._nx} x {self._ny} y, totally repeated for {pixelized_crystals.number_of_repetitions}")
         
         self._panel = panel
         self._crystals = pixelized_crystals
@@ -145,56 +208,185 @@ class PETGeometry():
             'field_of_view': {
                 'radius_mm': float(FOV_RADIUS)
             },
-            'output_file': self._output_filename
+            'output_file': self._output_filename, 
+            'scanner_info': self._scanner_info
         }
 
         output_file = Path(output_path)
         output_file.parent.mkdir(parents=True, exist_ok=True)
 
-        with open(output_file, 'w') as f:
+        with open(output_file.with_suffix('.json'), 'w') as f:
             json.dump(config, f, indent=2)
 
         print(f"Saved detector geometry to: {output_file}")
         return str(output_file)
+
+    def generate_lut(self):
+        """
+        Post-process the calibration ROOT file to generate a Scanner LUT.
         
-    def add_digitizer(self) -> None:
+        Outputs:
+            - output/scanner_lut.npy: Numpy array for PyTomography
+            - output/scanner_lut.root: ROOT file with unique crystal coordinates
+        """
+        import pandas as pd
+        import time
+        from pathlib import Path
+        print(f"\n[LUT GENERATION] Processing {self._output_filename}...")
+               
+        # 1. Read ROOT file
+        with uproot.open(self._output_filename) as f:
+            print(f"Opened tree file keys: {list(f.keys())}")
+            # We need the 'Reads' tree because it contains the readout (pixelated) positions
+            # Note: We need to parse IDs first using your utility
+            tree_data = {
+                key: f['Reads'][key].array(library="np")
+                for key in f['Reads'].keys()
+            }
+            print(f"Tree data keys: {list(tree_data.keys())}")
+            
+        # 2. Parse IDs (using your existing utility)
+        print("  Parsing volume IDs...")
+        tree_data = add_detector_ids_to_reads(tree_data, verbose=False)
+        
+        # 3. Create DataFrame
+        df = pd.DataFrame({
+            'rsectorID': tree_data['rsectorID'],
+            'moduleID': tree_data['moduleID'],
+            'submoduleID': tree_data['submoduleID'],
+            'crystalID': tree_data['crystalID'],
+            'volumeID': tree_data['TrackVolumeInstanceID'],
+            'x': tree_data['PostPosition_X'],
+            'y': tree_data['PostPosition_Y'],
+            'z': tree_data['PostPosition_Z']
+        })
+        
+        # 4. Drop duplicates to get unique crystals
+        # Since we used Readout, all hits in the same crystal should have identical positions
+        # (or very close centroids). We take the first occurrence.
+        unique_crystals = df.drop_duplicates(subset=['rsectorID', 'moduleID', 'submoduleID', 'crystalID'])
+        
+        expected_crystals = self._scanner_info['NrCrystalsPerRing'] * self._scanner_info['NrRings']
+        print(f"  Found {len(unique_crystals)} unique crystals (Expected: {expected_crystals})")
+        
+        if len(unique_crystals) != expected_crystals:
+            print(f"  [WARNING] Mismatch in crystal count! Simulation time might be too short.")
+        
+        # 5. Calculate Global ID for sorting
+        # Formula must match PyTomography's expectation
+        # ID = rsector * (crystals_per_rsector) + ...
+        # Based on your config: 
+        # rsectorTransNr=8, module=1, submodule=1, crystalTrans=50, crystalAxial=50
+        crystals_per_rsector = self._nx * self._ny # 2500
+        
+        # 注意：這裡的計算邏輯必須與您在 PyTomography 中使用的 gate.py 邏輯完全一致
+        # 假設 gate.py 是先排 module, 再排 submodule, 再排 crystal
+        unique_crystals['GlobalID'] = (
+            unique_crystals['rsectorID'] * crystals_per_rsector + 
+            unique_crystals['crystalID'] # 假設 crystalID 已經是 0-2499 的線性索引
+        )
+        
+        # 6. Sort by Global ID
+        lut_sorted = unique_crystals.sort_values('GlobalID')
+        
+        # 7. Save as .npy (for PyTomography)
+        lut_numpy = lut_sorted[['x', 'y', 'z']].values.astype(np.float32)
+        npy_path = os.path.join(os.path.dirname(self._output_filename), "scanner_lut.npy")
+        np.save(npy_path, lut_numpy)
+        print(f"  Saved PyTomography LUT: {npy_path}")
+        
+        # 8. Save as ROOT (as requested)
+        root_path = os.path.join(os.path.dirname(self._output_filename), "scanner_lut.root")
+        with uproot.recreate(root_path) as f:
+            f["LUT"] = {
+                "GlobalID": lut_sorted['GlobalID'].values,
+                "rsectorID": lut_sorted['rsectorID'].values,
+                "crystalID": lut_sorted['crystalID'].values,
+                "x": lut_sorted['x'].values,
+                "y": lut_sorted['y'].values,
+                "z": lut_sorted['z'].values
+            }
+        print(f"  Saved ROOT LUT: {root_path}")
+        
+    def add_digitizer(self,calibration_mode: bool = False) -> None:
         """
         Build digitizer chain for PET detector.
 
         Creates hits collection and readout actors to process detector events.
+        Uses volume repetition methods to properly track panel indices.
         """
         sim = self._sim
 
-        # Hits collection actor
+        # Print panel information for debugging
+        print(f"\nDigitizer Setup:")
+        print(f"  Number of panels: {self._panel.number_of_repetitions}")
+        print(f"  Number of crystals per panel: {self._crystals.number_of_repetitions}")
+        print(f"  Panel repetition names:")
+        for i in range(self._panel.number_of_repetitions):
+            panel_name = self._panel.get_repetition_name_from_index(i)
+            print(f"    Panel {i}: {panel_name}")
+
+        # Hits collection actor - attached to crystals with authorization for repeated volumes
         hc = sim.add_actor("DigitizerHitsCollectionActor", "Hits")
         hc.attached_to = self._crystals.name
         hc.authorize_repeated_volumes = True
         hc.output_filename = self._output_filename
         hc.attributes = [
-            "PostPosition",
-            "TotalEnergyDeposit",
-            "PreStepUniqueVolumeID",
-            "GlobalTime",
+            "PostPosition",              # Crystal impact position
+            "TotalEnergyDeposit",        # Energy deposited in crystal
+            "PreStepUniqueVolumeID",     # Machine-readable volume encoding
+            "GlobalTime",                # Geant4 simulation time
+            "EventID",                   # Primary particle ID
+            "TrackVolumeName",           # Full volume path (CRITICAL for rsectorID extraction)
+            "TrackVertexPosition",       # Source position for tracking
+            "TrackVolumeInstanceID"
         ]
 
-        # Readout actor
+        # Readout actor - groups hits by panel, discretizes by crystal
         sc = sim.add_actor("DigitizerReadoutActor", "Reads")
         sc.authorize_repeated_volumes = True
         sc.attached_to = self._crystals.name
         sc.input_digi_collection = hc.name
-        sc.group_volume = self._panel.name
-        sc.discretize_volume = self._crystals.name
+        sc.group_volume = self._panel.name  # Group by panel repetitions
+        sc.discretize_volume = self._crystals.name  # Discretize to crystal level
         sc.policy = "EnergyWeightedCentroidPosition"
         sc.output_filename = hc.output_filename
 
-        # Energy filter
-        # 在 add_digitizer 中加入
+        # * No need for energy resolution for calibration
+        if calibration_mode:
+            print("\n[INFO] Digitizer configured in CALIBRATION MODE")
+            print("  - Blurring: DISABLED")
+            print("  - Energy Window: DISABLED")
+            print("  - Output: Raw geometric centers from Readout")            
+            return hc, sc
+
+        # * Energy Blurring Actor (Simulation of Energy Resolution)
+        blur = sim.add_actor("DigitizerBlurringActor", "Blurring")
+        blur.input_digi_collection = sc.name  # Input comes from Readout (sc)
+        blur.blur_attribute = "TotalEnergyDeposit"
+        blur.blur_method = "Gaussian"
+        blur.blur_sigma = 1
+        if 'GAGG': # NEED CHANGE:
+            blur.blur_resolution = 0.06
+        elif 'LYSO':
+            blur.blur_resolution = 0.12 
+        blur.blur_reference_value = 511 * keV
+        blur.output_filename = hc.output_filename
+        # -------------------------------------------------------------
+        
+        # Energy filter - accepts photopeak window
         energy_filter = sim.add_actor("DigitizerEnergyWindowsActor", "EnergyFilter")
         energy_filter.input_digi_collection = hc.name
         energy_filter.channels = [
-            {"min": 400 * keV, "max": 650 * keV, "name": "scatter"}  # 只接受 511 keV 附近
+            {"min": 400 * keV, "max": 650 * keV, "name": "scatter"}  # 511 keV photopeak
         ]
         energy_filter.output_filename = hc.output_filename
+
+        print(f"\nDigitizer chain configured:")
+        print(f"  Stage 1: Hits collection (attached to {self._crystals.name})")
+        print(f"  Stage 2: Readout (group by {sc.group_volume} → rsectorID, discretize by {sc.discretize_volume} → crystalID)")
+        print(f"  Stage 3: Energy window (400-650 keV photopeak)")
+        print(f"  Output: {hc.output_filename}")
 
         return hc, sc
         
@@ -308,6 +500,28 @@ class PETGeometry():
     # SOURCE METHODS
     # ==========================================================================
 
+    def add_calibration_source(self):
+        """
+        Add a large cylindrical source to irradiate all crystals for geometry calibration.
+        """
+        sim = self._sim
+        print("Creating Calibration Source (Cylinder covering FOV)...")
+        
+        source = sim.add_source("GenericSource", "Calibration_Source")
+        source.particle = "gamma" 
+        source.energy.type = "mono"
+        source.energy.mono = 511 * keV
+        source.activity = 150 * MBq # High activity to hit everything quickly
+        
+        # Geometry: Cylinder slightly larger than FOV to ensure coverage
+        source.position.type = "cylinder"
+        source.position.radius = 1.2 * mm
+        source.position.dz = 5 * cm
+        source.direction.type = "iso"
+        
+        self._sources.append(source)
+        return source
+    
     def add_phantom_source(self, activity=10 * MBq, isotope="F18", activity_Bq_mL=None):
         """
         Add radioactive source to the phantom (for NEMA or Derenzo).
@@ -330,11 +544,9 @@ class PETGeometry():
         # Handle Derenzo phantom separately using external module
         sources = []
         if self._phantom['type'] == "Derenzo":
-            from phantom_derenzo import add_sources
-
             # Default equal activity for all 6 sectors if not specified
             if activity_Bq_mL is None:
-                activity_Bq_mL = [1e6 * Bq, 1e6 * Bq, 1e6 * Bq,  1e6 * Bq, 1e6 * Bq, 1e6 * Bq]
+                activity_Bq_mL = [activity] * 6
 
             # Use external add_sources function
             phantom_body = self._phantom['body']
@@ -509,10 +721,11 @@ class PETGeometry():
               default=False)
 @click.option('--sim-time', type=float, help="Seconds to simulate. Default to 0.0001 sec", 
               default=0.0001)
-@click.option('--output', type=str, help="Output file directory.", default="./output")
-@click.option('--scenario', type=click.Choice(['NEMA', 'Derenzo', 'Ring', 'Point'], case_sensitive=False), 
+@click.option('--output', type=click.Path(dir_okay=False, writable=True), help="Output file directory.", default="./output/events.root")
+@click.option('--scenario', type=click.Choice(['NEMA', 'Derenzo', 'Ring', 'Point', 'Calibration'], case_sensitive=False), 
               help="Simulation scenario to run. Default to 'Ring'.", default="Ring")
-def main(visu, sim_time, output, scenario):
+@click.option('-n', '--num-thread', type=int, help="Number of threads to use. Default to 1", default=32)
+def main(visu, sim_time, output, scenario, num_thread):
     """
     Example usage scenarios for PET simulation.
 
@@ -536,10 +749,9 @@ def main(visu, sim_time, output, scenario):
     sim.world.color = [1, 0, 1, 1]  # invisible
 
     # Create PET geometry
-    pet = PETGeometry(sim, debug=False)  # Set debug=True for faster 5x5 array
+    pet = PETGeometry(sim, str(output), debug=False)  # Set debug=True for faster 5x5 array
     pet.add_pet()
-    pet.add_digitizer()
-    pet._output_filename = output
+    pet.add_digitizer(calibration_mode=scenario == 'Calibration')
 
     # Save geometry configuration for visualization tools
     pet.save_geom()
@@ -566,23 +778,31 @@ def main(visu, sim_time, output, scenario):
         print(f"  - Created Derenzo phantom")
 
         # Add source to Derenzo phantom
-        source = pet.add_phantom_source(activity=20 * MBq, isotope="F18")
-        print(f"  - Added F-18 source with 20 MBq activity")
+        activity = 1 * MBq 
+        source = pet.add_phantom_source(activity=activity / num_thread, isotope="F18")
+        print(f"  - Added F-18 source with {activity} activity")
 
     elif scenario == "Ring":
         # Ring source configuration (no phantom)
-        source = pet.add_ring_source(radius=0.5 * cm, activity=150E6 * Bq, 
+        source = pet.add_ring_source(radius=0.5 * cm, activity=150E6 * Bq / num_thread, 
                                      pos=[5 * cm, 7 * cm, -5 * cm], isotope="F18")
         pass
     elif scenario == "Point":
         # Point source for calibration
         print("Creating point source...")
-        source = pet.add_point_source(position=[0, 0, 0], activity=1 * MBq, isotope="F18")
+        source = pet.add_point_source(position=[0, 0, 0], activity=1 * MBq / num_thread, isotope="F18")
         print(f"  - Position: center")
         print(f"  - Activity: 1 MBq F-18")
+    elif scenario == "Calibration":
+        print("Creating Geometry Calibration setup...")
+        pet.add_calibration_source()
+        # Calibration needs enough time to hit all crystals
+        # Override sim_time if it's too short (e.g. default 0.0001 is too short)
+        if sim_time < 1.0 and not visu:
+            print(f"  [NOTE] Increasing sim-time to 1.0s for calibration coverage")
 
     # Simulation parameters
-    sim.number_of_threads = 32
+    sim.number_of_threads = num_thread
     sim.random_seed = 123456
 
     # Visualization (disable for production runs)
@@ -597,12 +817,109 @@ def main(visu, sim_time, output, scenario):
         # Program will run into a deadlock if multi-threaded.
         sim.number_of_threads = 1
         # sim.run_timing_intervals = [(0, .000001 * sec)]
-        sim.run_timing_intervals = [(0, .00000001 * sec)]
+        sim.run_timing_intervals = [(0, .000001 * sec)]
 
     print("\nStarting simulation...")
     print("Close visualization window to end.")
     sim.run()
+    sim.close()
     print("Simulation complete!")
+    
+    # === CALIBRATION POST-PROCESSING ===
+    if scenario == "Calibration":
+        with uproot.open(pet._output_filename) as f:
+            print(f"Reading ROOT file: {pet._output_filename}")
+
+            # Get all tree names in the file
+            tree_names = [key for key in f.keys() if f[key].classname.startswith('TTree')]
+            print(f"Found {len(tree_names)} tree(s) in file: {tree_names}")
+        pet.generate_lut()
+        return # Skip coincidence processing for calibration
+    # ===================================
+    
+    # Calculating the coincidences
+    print("\nProcessing coincidences...")
+
+    with uproot.open(pet._output_filename) as f:
+        print(f"Reading ROOT file: {pet._output_filename}")
+
+        # Get all tree names in the file
+        tree_names = [key for key in f.keys() if f[key].classname.startswith('TTree')]
+        print(f"Found {len(tree_names)} tree(s) in file: {tree_names}")
+
+        # Read ALL existing trees into memory
+        all_trees = {}
+        for tree_name in tree_names:
+            print(f"  Loading tree '{tree_name}'...")
+            tree_name_clean = tree_name.split(';')[0]  # Remove cycle number if present
+            all_trees[tree_name_clean] = {
+                key: f[tree_name][key].array(library="np")
+                for key in f[tree_name].keys()
+            }
+
+        # Parse and add rsectorID, moduleID, submoduleID, and crystalID to Reads tree
+        print("  Parsing volume IDs to extract rsectorID and crystalID...")
+        all_trees['Reads'] = add_detector_ids_to_reads(all_trees['Reads'], verbose=True)
+
+        # Process coincidences from the Reads tree
+        print("  Processing coincidences...")
+        coincidences = coincidences_sorter(f['Reads'],
+                                           3 * gate.g4_units.nanosecond,
+                                           "takeAllGoods",
+                                           0.5 * gate.g4_units.mm,
+                                           "xy",
+                                           0.5 * gate.g4_units.mm,
+                                           chunk_size=100000,
+                                           return_type="dict"
+                                           )
+
+        # Add rsectorID, moduleID, submoduleID, and crystalID to coincidences
+        # This is needed as coincidences_sorter reads from f['Reads'] (file)
+        # which hasn't been modified with the detector IDs yet (those are in all_trees dict)
+        coincidences = add_detector_ids_to_coincidences(coincidences, verbose=True)
+
+
+    print(f"Found {len(coincidences[list(coincidences.keys())[0]])} coincidence events")
+
+    # Create temporary file with all trees + new Coincidences tree
+    temp_filename = pet._output_filename.replace('.root', '_temp.root')
+
+    print(f"\nCreating new ROOT file with all trees plus Coincidences...")
+    with uproot.recreate(temp_filename) as f:
+        # Write all original trees (now includes rsectorID, moduleID, submoduleID, crystalID)
+        for tree_name, tree_data in all_trees.items():
+            print(f"  Writing tree '{tree_name}' ({len(tree_data)} branches)")
+            f[tree_name] = tree_data
+
+        # Write the new Coincidences tree (already includes parsed IDs)
+        print(f"  Writing new tree 'Coincidences' ({len(coincidences)} branches)")
+        f["Coincidences"] = coincidences
+
+    # Atomically replace the original file with the new one
+    print(f"\nReplacing original file...")
+    os.replace(temp_filename, pet._output_filename)
+
+    print(f"\n✓ Successfully updated ROOT file: {pet._output_filename}")
+    print(f"  Total trees in file: {len(all_trees) + 1}")
+    print(f"  - Original trees: {', '.join(all_trees.keys())}")
+    print(f"  - New tree: Coincidences")
+    print(f"\nReads tree now includes:")
+    print(f"  - rsectorID (panel 0-7)")
+    print(f"  - moduleID (all = 0)")
+    print(f"  - submoduleID (all = 0)")
+    print(f"  - crystalID (crystal 0-2499)")
+    print(f"\nCoincidence tree contains {len(coincidences)} branches:")
+    coincidence_id_branches = [k for k in sorted(coincidences.keys()) if 'rsectorID' in k or 'moduleID' in k or 'submoduleID' in k or 'crystalID' in k]
+    if coincidence_id_branches:
+        print(f"  ID branches: {', '.join(coincidence_id_branches)}")
+    for key in sorted(coincidences.keys())[:10]:  # Show first 10 branches
+        print(f"  - {key}")
+    if len(coincidences) > 10:
+        print(f"  ... and {len(coincidences) - 10} more branches")
+
+    
+    # Saving the config
+    pet.save_geom()
     
     
 if __name__ == "__main__":
