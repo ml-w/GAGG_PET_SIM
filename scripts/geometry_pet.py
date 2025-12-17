@@ -8,6 +8,7 @@ import numpy as np
 import os
 from opengate.sources.base import SourceBase
 from opengate.geometry.volumes import VolumeBase
+from opengate.voxelize import voxelize_geometry, write_itk_image, write_voxelized_geometry
 from opengate.actors.digitizers import *
 from opengate.geometry.utility import get_grid_repetition, get_circular_repetition
 from opengate.sources.utility import get_spectrum
@@ -15,6 +16,7 @@ from opengate.actors.coincidences import coincidences_sorter
 from scipy.spatial.transform import Rotation
 from phantom_derenzo import add_derenzo_phantom, add_sources as derenzo_add_source
 import pathlib
+from pathlib import Path
 
 # Import detector ID parsing utilities
 from utils import (
@@ -63,7 +65,7 @@ def add_materials(sim):
         pass
 
 class PETGeometry():
-    def __init__(self, sim: gate.Simulation, output_file: str, debug: bool=False):
+    def __init__(self, sim: gate.Simulation, output_file: str, debug: bool=False, gen_attenuation_img: bool=False):
         self._sim = sim
         # pixelized crystal
         if debug:
@@ -89,6 +91,8 @@ class PETGeometry():
         # References to created objects
         self._phantom = None
         self._sources = []
+        
+        self._gen_attenuation_img = gen_attenuation_img
         
         self._scanner_info = {
             # Crystal configuration
@@ -278,12 +282,11 @@ class PETGeometry():
         # Based on your config: 
         # rsectorTransNr=8, module=1, submodule=1, crystalTrans=50, crystalAxial=50
         crystals_per_rsector = self._nx * self._ny # 2500
-        
-        # 注意：這裡的計算邏輯必須與您在 PyTomography 中使用的 gate.py 邏輯完全一致
-        # 假設 gate.py 是先排 module, 再排 submodule, 再排 crystal
+
+        # Following gate.py logic in pytomography        
         unique_crystals['GlobalID'] = (
             unique_crystals['rsectorID'] * crystals_per_rsector + 
-            unique_crystals['crystalID'] # 假設 crystalID 已經是 0-2499 的線性索引
+            unique_crystals['crystalID'] 
         )
         
         # 6. Sort by Global ID
@@ -291,12 +294,12 @@ class PETGeometry():
         
         # 7. Save as .npy (for PyTomography)
         lut_numpy = lut_sorted[['x', 'y', 'z']].values.astype(np.float32)
-        npy_path = os.path.join(os.path.dirname(self._output_filename), "scanner_lut.npy")
+        npy_path =  str(Path(self._output_filename).parent / "scanner_lut.npy")
         np.save(npy_path, lut_numpy)
         print(f"  Saved PyTomography LUT: {npy_path}")
         
         # 8. Save as ROOT (as requested)
-        root_path = os.path.join(os.path.dirname(self._output_filename), "scanner_lut.root")
+        root_path = str(Path(self._output_filename).parent / "scanner_lut.root")
         with uproot.recreate(root_path) as f:
             f["LUT"] = {
                 "GlobalID": lut_sorted['GlobalID'].values,
@@ -378,14 +381,14 @@ class PETGeometry():
         energy_filter = sim.add_actor("DigitizerEnergyWindowsActor", "EnergyFilter")
         energy_filter.input_digi_collection = hc.name
         energy_filter.channels = [
-            {"min": 400 * keV, "max": 650 * keV, "name": "scatter"}  # 511 keV photopeak
+            {"min": 480 * keV, "max": 550 * keV, "name": "scatter"}  # 511 keV photopeak
         ]
         energy_filter.output_filename = hc.output_filename
 
         print(f"\nDigitizer chain configured:")
         print(f"  Stage 1: Hits collection (attached to {self._crystals.name})")
         print(f"  Stage 2: Readout (group by {sc.group_volume} → rsectorID, discretize by {sc.discretize_volume} → crystalID)")
-        print(f"  Stage 3: Energy window (400-650 keV photopeak)")
+        print(f"  Stage 3: Energy window (480-550 keV photopeak)")
         print(f"  Output: {hc.output_filename}")
 
         return hc, sc
@@ -462,6 +465,16 @@ class PETGeometry():
             "spheres": sphere_volumes,
             "lung": lung_insert
         }
+
+        # * Not supported yet
+        # if self._gen_attenuation_img:
+        #     mumap = sim.add_actor("AttenuationImageActor", "mumap")
+        #     mumap.image_volume = phantom_body # volume for the moment, not the name
+        #     mumap.output_filename = str(Path(self._output_filename).with_suffix('.mhd'))
+        #     mumap.energy = 510 * keV
+        #     mumap.database = "NIST"
+        #     mumap.attenuation_image.write_to_disk = True
+        #     mumap.attenuation_image.active = False
 
         return self._phantom
 
@@ -725,7 +738,8 @@ class PETGeometry():
 @click.option('--scenario', type=click.Choice(['NEMA', 'Derenzo', 'Ring', 'Point', 'Calibration'], case_sensitive=False), 
               help="Simulation scenario to run. Default to 'Ring'.", default="Ring")
 @click.option('-n', '--num-thread', type=int, help="Number of threads to use. Default to 1", default=32)
-def main(visu, sim_time, output, scenario, num_thread):
+@click.option('--gen-attenuation-img', is_flag=True, help="If true, save the source attention image to the same output specified with suffix .mhd")
+def main(visu, sim_time, output, scenario, num_thread, gen_attenuation_img):
     """
     Example usage scenarios for PET simulation.
 
@@ -749,7 +763,7 @@ def main(visu, sim_time, output, scenario, num_thread):
     sim.world.color = [1, 0, 1, 1]  # invisible
 
     # Create PET geometry
-    pet = PETGeometry(sim, str(output), debug=False)  # Set debug=True for faster 5x5 array
+    pet = PETGeometry(sim, str(output), debug=False, gen_attenuation_img=gen_attenuation_img)  # Set debug=True for faster 5x5 array
     pet.add_pet()
     pet.add_digitizer(calibration_mode=scenario == 'Calibration')
 
@@ -785,7 +799,7 @@ def main(visu, sim_time, output, scenario, num_thread):
     elif scenario == "Ring":
         # Ring source configuration (no phantom)
         source = pet.add_ring_source(radius=0.5 * cm, activity=150E6 * Bq / num_thread, 
-                                     pos=[5 * cm, 7 * cm, -5 * cm], isotope="F18")
+                                     pos=[3 * cm, 0 * cm, -3 * cm], isotope="F18")
         pass
     elif scenario == "Point":
         # Point source for calibration
@@ -843,25 +857,26 @@ def main(visu, sim_time, output, scenario, num_thread):
     with uproot.open(pet._output_filename) as f:
         print(f"Reading ROOT file: {pet._output_filename}")
 
-        # Get all tree names in the file
-        tree_names = [key for key in f.keys() if f[key].classname.startswith('TTree')]
-        print(f"Found {len(tree_names)} tree(s) in file: {tree_names}")
+        # * Output to same file needs copying entire tree, stupid but no workaround.
+        # # Get all tree names in the file
+        # tree_names = [key for key in f.keys() if f[key].classname.startswith('TTree')]
+        # print(f"Found {len(tree_names)} tree(s) in file: {tree_names}")
 
-        # Read ALL existing trees into memory
-        all_trees = {}
-        for tree_name in tree_names:
-            print(f"  Loading tree '{tree_name}'...")
-            tree_name_clean = tree_name.split(';')[0]  # Remove cycle number if present
-            all_trees[tree_name_clean] = {
-                key: f[tree_name][key].array(library="np")
-                for key in f[tree_name].keys()
-            }
+        # # Read ALL existing trees into memory
+        # all_trees = {}
+        # for tree_name in tree_names:
+        #     print(f"  Loading tree '{tree_name}'...")
+        #     tree_name_clean = tree_name.split(';')[0]  # Remove cycle number if present
+        #     all_trees[tree_name_clean] = {
+        #         key: f[tree_name][key].array(library="np")
+        #         for key in f[tree_name].keys()
+        #     }
 
-        # Parse and add rsectorID, moduleID, submoduleID, and crystalID to Reads tree
-        print("  Parsing volume IDs to extract rsectorID and crystalID...")
-        all_trees['Reads'] = add_detector_ids_to_reads(all_trees['Reads'], verbose=True)
+        # # Parse and add rsectorID, moduleID, submoduleID, and crystalID to Reads tree
+        # print("  Parsing volume IDs to extract rsectorID and crystalID...")
+        # all_trees['Reads'] = add_detector_ids_to_reads(all_trees['Reads'], verbose=True)
 
-        # Process coincidences from the Reads tree
+        # # Process coincidences from the Reads tree
         print("  Processing coincidences...")
         coincidences = coincidences_sorter(f['Reads'],
                                            3 * gate.g4_units.nanosecond,
@@ -881,25 +896,32 @@ def main(visu, sim_time, output, scenario, num_thread):
 
     print(f"Found {len(coincidences[list(coincidences.keys())[0]])} coincidence events")
 
-    # Create temporary file with all trees + new Coincidences tree
-    temp_filename = pet._output_filename.replace('.root', '_temp.root')
+    # * Output to same file
+    # # Create temporary file with all trees + new Coincidences tree
+    # temp_filename = pet._output_filename.replace('.root', '_temp.root')
 
-    print(f"\nCreating new ROOT file with all trees plus Coincidences...")
-    with uproot.recreate(temp_filename) as f:
-        # Write all original trees (now includes rsectorID, moduleID, submoduleID, crystalID)
-        for tree_name, tree_data in all_trees.items():
-            print(f"  Writing tree '{tree_name}' ({len(tree_data)} branches)")
-            f[tree_name] = tree_data
+    # print(f"\nCreating new ROOT file with all trees plus Coincidences...")
+    # with uproot.recreate(temp_filename) as f:
+    #     # Write all original trees (now includes rsectorID, moduleID, submoduleID, crystalID)
+    #     for tree_name, tree_data in all_trees.items():
+    #         print(f"  Writing tree '{tree_name}' ({len(tree_data)} branches)")
+    #         f[tree_name] = tree_data
 
-        # Write the new Coincidences tree (already includes parsed IDs)
-        print(f"  Writing new tree 'Coincidences' ({len(coincidences)} branches)")
+    #     # Write the new Coincidences tree (already includes parsed IDs)
+    #     print(f"  Writing new tree 'Coincidences' ({len(coincidences)} branches)")
+    #     f["Coincidences"] = coincidences
+
+    # # Atomically replace the original file with the new one
+    # print(f"\nReplacing original file...")
+    # os.replace(temp_filename, pet._output_filename)
+
+    # * Output to different file
+    p = Path(pet._output_filename)
+    coincidences_root = p.with_stem(p.stem + "_coincidence")
+    with uproot.create(str(coincidences_root)) as f:
         f["Coincidences"] = coincidences
 
-    # Atomically replace the original file with the new one
-    print(f"\nReplacing original file...")
-    os.replace(temp_filename, pet._output_filename)
-
-    print(f"\n✓ Successfully updated ROOT file: {pet._output_filename}")
+    print(f"\n✓ Successfully updated ROOT file: {pet._output_filename}, {str(coincidences_root)}")
     print(f"  Total trees in file: {len(all_trees) + 1}")
     print(f"  - Original trees: {', '.join(all_trees.keys())}")
     print(f"  - New tree: Coincidences")
