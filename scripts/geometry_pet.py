@@ -5,7 +5,7 @@ import click, rich
 import uproot
 import math, scipy
 import numpy as np
-import os
+import os, re, ast
 from opengate.sources.base import SourceBase
 from opengate.geometry.volumes import VolumeBase
 from opengate.voxelize import voxelize_geometry, write_itk_image, write_voxelized_geometry
@@ -32,6 +32,8 @@ from utils import (
 # ==============================================================================
 
 sec = gate.g4_units.second
+ms = gate.g4_units.ms
+us = gate.g4_units.us
 cm = gate.g4_units.cm
 mm = gate.g4_units.mm
 deg = gate.g4_units.deg
@@ -145,7 +147,7 @@ class PETGeometry():
         # Housing
         panel  = sim.add_volume("Box", name="Panel")
         panel.mother = sim.world.name
-        panel.material = "Aluminium"
+        panel.material = "G4_AIR"
         panel.size = self._housing_size
         panel.color = [0.5, 0.5, 0.5, 1]  # grey
         trans, rot = get_circular_repetition(
@@ -329,6 +331,9 @@ class PETGeometry():
             panel_name = self._panel.get_repetition_name_from_index(i)
             print(f"    Panel {i}: {panel_name}")
 
+        # Handing filenames
+        p = Path(self._output_filename)
+
         # Hits collection actor - attached to crystals with authorization for repeated volumes
         hc = sim.add_actor("DigitizerHitsCollectionActor", "Hits")
         hc.attached_to = self._crystals.name
@@ -342,7 +347,15 @@ class PETGeometry():
             "EventID",                   # Primary particle ID
             "TrackVolumeName",           # Full volume path (CRITICAL for rsectorID extraction)
             "TrackVertexPosition",       # Source position for tracking
-            "TrackVolumeInstanceID"
+        ]
+
+        # Energy filter - accepts photopeak window
+        energy_filter = sim.add_actor("DigitizerEnergyWindowsActor", "EnergyFilter")
+        energy_filter.attached_to = hc.attached_to
+        energy_filter.authorize_repeated_volumes = True
+        energy_filter.input_digi_collection = hc.name
+        energy_filter.channels = [
+            {"min": 480 * keV, "max": 550 * keV, "name": "scatter"}  # 511 keV photopeak
         ]
 
         # Readout actor - groups hits by panel, discretizes by crystal
@@ -353,7 +366,7 @@ class PETGeometry():
         sc.group_volume = self._panel.name  # Group by panel repetitions
         sc.discretize_volume = self._crystals.name  # Discretize to crystal level
         sc.policy = "EnergyWeightedCentroidPosition"
-        sc.output_filename = hc.output_filename
+        sc.output_filename = self._output_filename
 
         # * No need for energy resolution for calibration
         if calibration_mode:
@@ -364,26 +377,21 @@ class PETGeometry():
             return hc, sc
 
         # * Energy Blurring Actor (Simulation of Energy Resolution)
-        blur = sim.add_actor("DigitizerBlurringActor", "Blurring")
+        blur = sim.add_actor("DigitizerBlurringActor", "Blurred")
+        blur.authorize_repeated_volumes = True
+        blur.attached_to = self._crystals.name
         blur.input_digi_collection = sc.name  # Input comes from Readout (sc)
         blur.blur_attribute = "TotalEnergyDeposit"
         blur.blur_method = "Gaussian"
-        blur.blur_sigma = 1
+        blur.blur_sigma = 3 * keV
         if 'GAGG': # NEED CHANGE:
             blur.blur_resolution = 0.06
         elif 'LYSO':
             blur.blur_resolution = 0.12 
         blur.blur_reference_value = 511 * keV
         blur.output_filename = hc.output_filename
-        # -------------------------------------------------------------
         
-        # Energy filter - accepts photopeak window
-        energy_filter = sim.add_actor("DigitizerEnergyWindowsActor", "EnergyFilter")
-        energy_filter.input_digi_collection = hc.name
-        energy_filter.channels = [
-            {"min": 480 * keV, "max": 550 * keV, "name": "scatter"}  # 511 keV photopeak
-        ]
-        energy_filter.output_filename = hc.output_filename
+        # -------------------------------------------------------------
 
         print(f"\nDigitizer chain configured:")
         print(f"  Stage 1: Hits collection (attached to {self._crystals.name})")
@@ -419,7 +427,7 @@ class PETGeometry():
 
         # Main phantom body (simplified as cylinder for this implementation)
         # Actual NEMA phantom is elliptical, but cylinder is easier to implement
-        phantom_body: VolumeBase = sim.add_volume("Cylinder", "NEMA_Body")
+        phantom_body: VolumeBase = sim.add_volume("TubsVolume", "NEMA_Body")
         phantom_body.rmax = 9.5 * cm  # Approximate radius
         phantom_body.dz = 18 * cm  # 180 mm length
         phantom_body.material = "G4_WATER"
@@ -441,7 +449,7 @@ class PETGeometry():
             z = 0  # All spheres in same plane
 
             # Create sphere
-            sphere = sim.add_volume("Sphere", f"NEMA_Sphere_{diameter}mm")
+            sphere = sim.add_volume("SphereVolume", f"NEMA_Sphere_{diameter}mm")
             sphere.rmax = diameter * mm / 2
             sphere.material = "G4_WATER"
             sphere.mother = phantom_body.name
@@ -451,7 +459,7 @@ class PETGeometry():
             sphere_volumes.append(sphere)
 
         # Add lung insert (low-density cylinder)
-        lung_insert = sim.add_volume("Cylinder", "NEMA_Lung_Insert")
+        lung_insert = sim.add_volume("TubsVolume", "NEMA_Lung_Insert")
         lung_insert.rmax = 2.55 * cm  # 51 mm diameter
         lung_insert.dz = 18 * cm  # Full phantom length
         lung_insert.material = "G4_LUNG_ICRP"
@@ -476,7 +484,7 @@ class PETGeometry():
         #     mumap.attenuation_image.write_to_disk = True
         #     mumap.attenuation_image.active = False
 
-        return self._phantom
+        return phantom_body
 
     def add_derenzo_phantom(self):
         """
@@ -498,8 +506,8 @@ class PETGeometry():
         sim = self._sim
 
         # Create phantom using external module
-        phantom_body = add_derenzo_phantom(sim, name="derenzo", scale_factor=0.33333)
-
+        phantom_body = add_derenzo_phantom(sim, name="derenzo", scale_factor=0.33333)      
+                
         # Store phantom reference
         self._phantom = {
             "type": "Derenzo",
@@ -734,12 +742,14 @@ class PETGeometry():
               default=False)
 @click.option('--sim-time', type=float, help="Seconds to simulate. Default to 0.0001 sec", 
               default=0.0001)
-@click.option('--output', type=click.Path(dir_okay=False, writable=True), help="Output file directory.", default="./output/events.root")
+@click.option('-t', '--time-slices', type=str, default='[0]',
+              help="Time slices as a comma-separated list, e.g., '[0,1,2,3]' or '0,1,2,3'")
+@click.option('--output', type=click.Path(dir_okay=False, writable=True, path_type=Path), help="Output file directory.", default="./output/events.root")
 @click.option('--scenario', type=click.Choice(['NEMA', 'Derenzo', 'Ring', 'Point', 'Calibration'], case_sensitive=False), 
               help="Simulation scenario to run. Default to 'Ring'.", default="Ring")
 @click.option('-n', '--num-thread', type=int, help="Number of threads to use. Default to 1", default=32)
 @click.option('--gen-attenuation-img', is_flag=True, help="If true, save the source attention image to the same output specified with suffix .mhd")
-def main(visu, sim_time, output, scenario, num_thread, gen_attenuation_img):
+def main(visu, sim_time, time_slices, output, scenario, num_thread, gen_attenuation_img):
     """
     Example usage scenarios for PET simulation.
 
@@ -750,6 +760,21 @@ def main(visu, sim_time, output, scenario, num_thread, gen_attenuation_img):
     4. Point source for calibration+
     """
 
+    # * Verify input
+    # Time
+    if not re.match(r'[\[\(][0-9, ]*[\]\)]', time_slices):
+        raise ValueError("Cannot parse time slices, please input a list of int or tuple or int.")
+    time_slices = ast.literal_eval(f"{time_slices}")
+    # Automatic rename
+    _sim_time = sim_time * sec
+    simtime_unit = 's' if _sim_time >= sec else 'ms' if _sim_time >= ms else 'us' if _sim_time >= us else 'ps'
+    simtime_suffix = f"{_sim_time / sec:.0f}{simtime_unit}" if simtime_unit == 's' \
+        else f"{_sim_time / us:.0f}{simtime_unit}" if simtime_unit == 'us' \
+            else f"{_sim_time / ms:.0f}{simtime_unit}" if simtime_unit == 'ms' \
+                else f"{_sim_time:.0f}ps"
+    output = output.with_stem(output.stem + f'_{"-".join([str(s) for s in time_slices])}' + f'_{simtime_suffix}')
+    print(f"Automatically renamed output: {str(output)}")
+
     # ==========================================================================
     # SCENARIO 1: NEMA IQ Phantom (Image Quality Assessment)
     # ==========================================================================
@@ -759,7 +784,7 @@ def main(visu, sim_time, output, scenario, num_thread, gen_attenuation_img):
     add_materials(sim)
     sim.check_volumes_overlap = True
     sim.world.size = [WORLD_RADIUS * 2, WORLD_RADIUS * 2, WORLD_DEPTH]
-    sim.world.material = "Air"
+    sim.world.material = "G4_AIR"
     sim.world.color = [1, 0, 1, 1]  # invisible
 
     # Create PET geometry
@@ -777,7 +802,7 @@ def main(visu, sim_time, output, scenario, num_thread, gen_attenuation_img):
         # Add NEMA IQ phantom
         print("Creating NEMA IQ phantom...")
         phantom = pet.add_nema_iq_phantom()
-        print(f"  - Created {len(phantom['spheres'])} spheres")
+        print(f"  - Created NEMA spheres")
         print(f"  - Sphere diameters: 10, 13, 17, 22, 28, 37 mm")
 
         # Add F-18 source to phantom
@@ -815,6 +840,17 @@ def main(visu, sim_time, output, scenario, num_thread, gen_attenuation_img):
         if sim_time < 1.0 and not visu:
             print(f"  [NOTE] Increasing sim-time to 1.0s for calibration coverage")
 
+    # ==================================
+    # Save phantom to attenuation images
+    # ==================================
+    if gen_attenuation_img:
+        print(f"  Saving phantom...")
+        fname = Path(output).with_suffix(".mhd")
+        volume_labels, image = sim.voxelize_geometry(extent=phantom, spacing=(1, 1, 1), filename=str(fname))
+        # verify saved
+        if fname.is_file():
+            print(f"  Phantom saved to: {str(fname)}")
+
     # Simulation parameters
     sim.number_of_threads = num_thread
     sim.random_seed = 123456
@@ -824,15 +860,17 @@ def main(visu, sim_time, output, scenario, num_thread, gen_attenuation_img):
 
     # Run parameters (for actual simulation, not just visualization)
     # Uncomment and adjust for production:
-    sim.run_timing_intervals = [(0, sim_time * sec)]  # 1 second acquisition
+    sim.run_timing_intervals = [(t * sec, (t + sim_time) * sec) for t in time_slices] # 1 second acquisition
+    print(f"  - 🕰️ time slices {sim.run_timing_intervals}")
     # sim.number_of_events = 1e4  # Number of primary particles
 
     if sim.visu:
         # Program will run into a deadlock if multi-threaded.
         sim.number_of_threads = 1
         # sim.run_timing_intervals = [(0, .000001 * sec)]
-        sim.run_timing_intervals = [(0, .000001 * sec)]
-
+        if scenario == "Derenzo":
+            sim.run_timing_intervals = [(0, .00000001 * sec)]
+    
     print("\nStarting simulation...")
     print("Close visualization window to end.")
     sim.run()
@@ -857,25 +895,6 @@ def main(visu, sim_time, output, scenario, num_thread, gen_attenuation_img):
     with uproot.open(pet._output_filename) as f:
         print(f"Reading ROOT file: {pet._output_filename}")
 
-        # * Output to same file needs copying entire tree, stupid but no workaround.
-        # # Get all tree names in the file
-        # tree_names = [key for key in f.keys() if f[key].classname.startswith('TTree')]
-        # print(f"Found {len(tree_names)} tree(s) in file: {tree_names}")
-
-        # # Read ALL existing trees into memory
-        # all_trees = {}
-        # for tree_name in tree_names:
-        #     print(f"  Loading tree '{tree_name}'...")
-        #     tree_name_clean = tree_name.split(';')[0]  # Remove cycle number if present
-        #     all_trees[tree_name_clean] = {
-        #         key: f[tree_name][key].array(library="np")
-        #         for key in f[tree_name].keys()
-        #     }
-
-        # # Parse and add rsectorID, moduleID, submoduleID, and crystalID to Reads tree
-        # print("  Parsing volume IDs to extract rsectorID and crystalID...")
-        # all_trees['Reads'] = add_detector_ids_to_reads(all_trees['Reads'], verbose=True)
-
         # # Process coincidences from the Reads tree
         print("  Processing coincidences...")
         coincidences = coincidences_sorter(f['Reads'],
@@ -896,41 +915,18 @@ def main(visu, sim_time, output, scenario, num_thread, gen_attenuation_img):
 
     print(f"Found {len(coincidences[list(coincidences.keys())[0]])} coincidence events")
 
-    # * Output to same file
-    # # Create temporary file with all trees + new Coincidences tree
-    # temp_filename = pet._output_filename.replace('.root', '_temp.root')
-
-    # print(f"\nCreating new ROOT file with all trees plus Coincidences...")
-    # with uproot.recreate(temp_filename) as f:
-    #     # Write all original trees (now includes rsectorID, moduleID, submoduleID, crystalID)
-    #     for tree_name, tree_data in all_trees.items():
-    #         print(f"  Writing tree '{tree_name}' ({len(tree_data)} branches)")
-    #         f[tree_name] = tree_data
-
-    #     # Write the new Coincidences tree (already includes parsed IDs)
-    #     print(f"  Writing new tree 'Coincidences' ({len(coincidences)} branches)")
-    #     f["Coincidences"] = coincidences
-
-    # # Atomically replace the original file with the new one
-    # print(f"\nReplacing original file...")
-    # os.replace(temp_filename, pet._output_filename)
-
     # * Output to different file
     p = Path(pet._output_filename)
     coincidences_root = p.with_stem(p.stem + "_coincidence")
-    with uproot.create(str(coincidences_root)) as f:
-        f["Coincidences"] = coincidences
+    try:
+        with uproot.create(str(coincidences_root)) as f:
+            f["Coincidences"] = coincidences
+    except FileExistsError:
+        print(f"⚠️[WARNING]: Output file exist, rewriting...")
+        with uproot.recreate(str(coincidences_root)) as f:
+            f["Coincidences"] = coincidences
+    print(f"Saved the Coincidences")
 
-    print(f"\n✓ Successfully updated ROOT file: {pet._output_filename}, {str(coincidences_root)}")
-    print(f"  Total trees in file: {len(all_trees) + 1}")
-    print(f"  - Original trees: {', '.join(all_trees.keys())}")
-    print(f"  - New tree: Coincidences")
-    print(f"\nReads tree now includes:")
-    print(f"  - rsectorID (panel 0-7)")
-    print(f"  - moduleID (all = 0)")
-    print(f"  - submoduleID (all = 0)")
-    print(f"  - crystalID (crystal 0-2499)")
-    print(f"\nCoincidence tree contains {len(coincidences)} branches:")
     coincidence_id_branches = [k for k in sorted(coincidences.keys()) if 'rsectorID' in k or 'moduleID' in k or 'submoduleID' in k or 'crystalID' in k]
     if coincidence_id_branches:
         print(f"  ID branches: {', '.join(coincidence_id_branches)}")

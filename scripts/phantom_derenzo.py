@@ -1,45 +1,16 @@
 """
-Derenzo Phantom for PET Spatial Resolution Testing
+Derenzo Phantom for PET Spatial Resolution Testing - Explicit Volume Version
 
-This module implements a Derenzo (Hot Rod) phantom with 6 sectors containing
-different rod diameters for spatial resolution evaluation in PET imaging.
+This is a modified version of phantom_derenzo.py that creates each hot rod as an
+individual volume instead of using translation lists. This allows the phantom to
+be voxelized properly with OpenGATE's sim.voxelize_geometry().
+
+Key differences from original:
+- Each cylinder is created as a separate volume (e.g., tubs_1_rod_0, tubs_1_rod_1, etc.)
+- No translation lists - each volume has a single translation
+- Fully compatible with OpenGATE voxelization
 
 Reference: https://doi.org/10.3390/diagnostics15111387
-
-Default phantom dimensions (scale_factor=1.0):
-- Phantom body: 300 × 300 × 50 mm (Box)
-- Rod diameters: 14.5, 9.3, 7.85, 6.5, 5.75, 5.0 mm (6 sectors)
-- Rod height: 24 mm
-
-Recommended Scale Factors:
-------------------------
-Clinical PET (human):
-  scale_factor = 1.0 (default)
-  - Rod sizes: 5.0 - 14.5 mm
-  - Suitable for clinical scanners with ~4-5 mm spatial resolution
-
-Small Animal PET (mouse/rat):
-  scale_factor = 0.3 - 0.5
-  - scale_factor = 0.3: Rod sizes 1.5 - 4.4 mm (micro-PET, <1 mm resolution)
-  - scale_factor = 0.4: Rod sizes 2.0 - 5.8 mm (small animal, ~1-2 mm resolution)
-  - scale_factor = 0.5: Rod sizes 2.5 - 7.3 mm (high-res small animal)
-
-Preclinical PET (primate/large animal):
-  scale_factor = 0.7 - 0.8
-  - Rod sizes: 3.5 - 11.6 mm (scale=0.7)
-  - Intermediate between clinical and small animal
-
-Example Usage:
---------------
-# Small animal PET (mouse)
-derenzo = add_derenzo_phantom(sim, name="derenzo_mouse", scale_factor=0.3)
-
-# Clinical PET (human)
-derenzo = add_derenzo_phantom(sim, name="derenzo_clinical", scale_factor=1.0)
-
-# Add radioactive sources
-activity_Bq_mL = [1e6, 1e6, 1e6, 1e6, 1e6, 1e6]  # Equal activity in all sectors
-sources = add_sources(sim, derenzo, activity_Bq_mL)
 """
 
 import opengate as gate
@@ -53,58 +24,52 @@ mm = gate.g4_units.mm
 
 def add_derenzo_phantom(sim, name="derenzo", scale_factor=1.0):
     """
-    Add a Derenzo phantom with 6 sets of cylinders of different size for each set.
-    The phantom is described in https://doi.org/10.3390/diagnostics15111387
+    Add a Derenzo phantom with 6 sets of cylinders of different sizes.
+    Each cylinder is created as an individual volume for voxelization compatibility.
+    
+    Aware that using translation list vectors also works for the simulation, but it prevents
+    the phantom to be saved. That's why we are using for loop to create this phantom.
 
     Args:
         sim: OpenGATE simulation object
         name: Name for the phantom volume (default "derenzo")
         scale_factor: Scaling factor for all dimensions (default 1.0)
-                      Recommended values:
-                      - 1.0: Clinical PET (5.0-14.5 mm rods)
-                      - 0.5: Small animal PET (2.5-7.3 mm rods)
-                      - 0.3: Micro-PET (1.5-4.4 mm rods)
 
     Returns:
         phantom_body: The main phantom volume object
-
-    Example:
-        # Create small animal phantom
-        derenzo = add_derenzo_phantom(sim, name="derenzo_mouse", scale_factor=0.4)
     """
+    # Configs
+    PHANTOM_THICKNESS = 8 * cm
+    ROD_LENGTH = (PHANTOM_THICKNESS - 2 * cm)/2.
+    
+    # Create phantom body (air-filled box)
     phantom_body = sim.add_volume("Box", name)
-    phantom_body.size = [30 * cm * scale_factor, 30 * cm * scale_factor, 5 * cm * scale_factor]
+    phantom_body.size = [30 * cm * scale_factor, 30 * cm * scale_factor, PHANTOM_THICKNESS * scale_factor] # 1 cm covers
     phantom_body.mother = "world"
-    phantom_body.material = "G4_AIR"
+    phantom_body.material = "G4_WATER"
     rot = R.from_euler("x", [-90], degrees=True)
     phantom_body.rotation = rot.as_matrix()
     yellow = [1, 1, 0, 0.5]
 
-    tubs_1 = sim.add_volume("Tubs", f"{phantom_body.name}_tubs_1")
-    tubs_1.material = "G4_WATER"
-    tubs_1.mother = phantom_body.name
-    tubs_1.rmin = 0 * mm
-    tubs_1.rmax = 14.5 * mm * scale_factor
-    tubs_1.dz = 12 * mm * scale_factor
-    tubs_1.color = yellow
-    tubs_1.translation = [29 * mm, 1.5 * mm, 105 * mm]
-    m = R.identity().as_matrix()
-    tubs_1.translation = [
+    # Sector 1: 14.5 mm diameter rods (3 rods)
+    sector_1_positions = [
         [29 * mm * scale_factor, 105 * mm * scale_factor, 0],
         [-29 * mm * scale_factor, 105 * mm * scale_factor, 0],
         [0 * mm * scale_factor, 54.77 * mm * scale_factor, 0],
     ]
 
-    tubs_2 = sim.add_volume("Tubs", f"{phantom_body.name}_tubs_2")
-    tubs_2.material = "G4_WATER"
-    tubs_2.mother = phantom_body.name
-    tubs_2.rmin = 0 * mm
-    tubs_2.rmax = 9.3 * mm * scale_factor
-    tubs_2.dz = 12 * mm * scale_factor
-    tubs_2.color = yellow
-    tubs_2.translation = [29 * mm, 1.5 * mm, 105 * mm]
-    m = R.identity().as_matrix()
-    tubs_2.translation = [
+    for i, pos in enumerate(sector_1_positions):
+        rod = sim.add_volume("Tubs", f"{phantom_body.name}_tubs_1_rod_{i}")
+        rod.material = "G4_WATER"
+        rod.mother = phantom_body.name
+        rod.rmin = 0 * mm
+        rod.rmax = 14.5 * mm * scale_factor
+        rod.dz = ROD_LENGTH * scale_factor
+        rod.color = yellow
+        rod.translation = pos
+
+    # Sector 2: 9.3 mm diameter rods (6 rods)
+    sector_2_positions = [
         [66 * mm * scale_factor, 25 * mm * scale_factor, 0],
         [66 * mm * scale_factor, 89.44 * mm * scale_factor, 0],
         [28.8 * mm * scale_factor, 25 * mm * scale_factor, 0],
@@ -113,16 +78,18 @@ def add_derenzo_phantom(sim, name="derenzo", scale_factor=1.0):
         [47.5 * mm * scale_factor, 57.21 * mm * scale_factor, 0],
     ]
 
-    tubs_3 = sim.add_volume("Tubs", f"{phantom_body.name}_tubs_3")
-    tubs_3.material = "G4_WATER"
-    tubs_3.mother = phantom_body.name
-    tubs_3.rmin = 0 * mm
-    tubs_3.rmax = 7.85 * mm * scale_factor
-    tubs_3.dz = 12 * mm * scale_factor
-    tubs_3.color = yellow
-    tubs_3.translation = [29 * mm, 1.5 * mm, 105 * mm]
-    m = R.identity().as_matrix()
-    tubs_3.translation = [
+    for i, pos in enumerate(sector_2_positions):
+        rod = sim.add_volume("Tubs", f"{phantom_body.name}_tubs_2_rod_{i}")
+        rod.material = "G4_WATER"
+        rod.mother = phantom_body.name
+        rod.rmin = 0 * mm
+        rod.rmax = 9.3 * mm * scale_factor
+        rod.dz = ROD_LENGTH * scale_factor
+        rod.color = yellow
+        rod.translation = pos
+
+    # Sector 3: 7.85 mm diameter rods (10 rods)
+    sector_3_positions = [
         [66 * mm * scale_factor, -45.19 * mm * scale_factor, 0],
         [97.4 * mm * scale_factor, -45.19 * mm * scale_factor, 0],
         [34.6 * mm * scale_factor, -45.19 * mm * scale_factor, 0],
@@ -135,16 +102,18 @@ def add_derenzo_phantom(sim, name="derenzo", scale_factor=1.0):
         [66 * mm * scale_factor, -99.57 * mm * scale_factor, 0],
     ]
 
-    tubs_4 = sim.add_volume("Tubs", f"{phantom_body.name}_tubs_4")
-    tubs_4.material = "G4_WATER"
-    tubs_4.mother = phantom_body.name
-    tubs_4.rmin = 0 * mm
-    tubs_4.rmax = 6.5 * mm * scale_factor
-    tubs_4.dz = 12 * mm * scale_factor
-    tubs_4.color = yellow
-    tubs_4.translation = [29 * mm, 1.5 * mm, 105 * mm]
-    m = R.identity().as_matrix()
-    tubs_4.translation = [
+    for i, pos in enumerate(sector_3_positions):
+        rod = sim.add_volume("Tubs", f"{phantom_body.name}_tubs_3_rod_{i}")
+        rod.material = "G4_WATER"
+        rod.mother = phantom_body.name
+        rod.rmin = 0 * mm
+        rod.rmax = 7.85 * mm * scale_factor
+        rod.dz = ROD_LENGTH * scale_factor
+        rod.color = yellow
+        rod.translation = pos
+
+    # Sector 4: 6.5 mm diameter rods (10 rods)
+    sector_4_positions = [
         [0 * mm * scale_factor, -91.69 * mm * scale_factor, 0],
         [0 * mm * scale_factor, -46.67 * mm * scale_factor, 0],
         [26 * mm * scale_factor, -91.69 * mm * scale_factor, 0],
@@ -157,16 +126,18 @@ def add_derenzo_phantom(sim, name="derenzo", scale_factor=1.0):
         [39 * mm * scale_factor, -114.2 * mm * scale_factor, 0],
     ]
 
-    tubs_5 = sim.add_volume("Tubs", f"{phantom_body.name}_tubs_5")
-    tubs_5.material = "G4_WATER"
-    tubs_5.mother = phantom_body.name
-    tubs_5.rmin = 0 * mm
-    tubs_5.rmax = 5.75 * mm * scale_factor
-    tubs_5.dz = 12 * mm * scale_factor
-    tubs_5.color = yellow
-    tubs_5.translation = [29 * mm, 1.5 * mm, 105 * mm]
-    m = R.identity().as_matrix()
-    tubs_5.translation = [
+    for i, pos in enumerate(sector_4_positions):
+        rod = sim.add_volume("Tubs", f"{phantom_body.name}_tubs_4_rod_{i}")
+        rod.material = "G4_WATER"
+        rod.mother = phantom_body.name
+        rod.rmin = 0 * mm
+        rod.rmax = 6.5 * mm * scale_factor
+        rod.dz = ROD_LENGTH * scale_factor
+        rod.color = yellow
+        rod.translation = pos
+
+    # Sector 5: 5.75 mm diameter rods (10 rods)
+    sector_5_positions = [
         [-66 * mm * scale_factor, -42.92 * mm * scale_factor, 0],
         [-89 * mm * scale_factor, -42.92 * mm * scale_factor, 0],
         [-43 * mm * scale_factor, -42.92 * mm * scale_factor, 0],
@@ -179,16 +150,18 @@ def add_derenzo_phantom(sim, name="derenzo", scale_factor=1.0):
         [-100.5 * mm * scale_factor, -23 * mm * scale_factor, 0],
     ]
 
-    tubs_6 = sim.add_volume("Tubs", f"{phantom_body.name}_tubs_6")
-    tubs_6.material = "G4_WATER"
-    tubs_6.mother = phantom_body.name
-    tubs_6.rmin = 0 * mm
-    tubs_6.rmax = 5 * mm * scale_factor
-    tubs_6.dz = 12 * mm * scale_factor
-    tubs_6.color = yellow
-    tubs_6.translation = [29 * mm, 1.5 * mm, 105 * mm]
-    m = R.identity().as_matrix()
-    tubs_6.translation = [
+    for i, pos in enumerate(sector_5_positions):
+        rod = sim.add_volume("Tubs", f"{phantom_body.name}_tubs_5_rod_{i}")
+        rod.material = "G4_WATER"
+        rod.mother = phantom_body.name
+        rod.rmin = 0 * mm
+        rod.rmax = 5.75 * mm * scale_factor
+        rod.dz = ROD_LENGTH * scale_factor
+        rod.color = yellow
+        rod.translation = pos
+
+    # Sector 6: 5.0 mm diameter rods (15 rods)
+    sector_6_positions = [
         [-66 * mm * scale_factor, 17 * mm * scale_factor, 0],
         [-46 * mm * scale_factor, 17 * mm * scale_factor, 0],
         [-26 * mm * scale_factor, 17 * mm * scale_factor, 0],
@@ -205,33 +178,65 @@ def add_derenzo_phantom(sim, name="derenzo", scale_factor=1.0):
         [-56 * mm * scale_factor, 68.96 * mm * scale_factor, 0],
         [-66 * mm * scale_factor, 86.28 * mm * scale_factor, 0],
     ]
+
+    for i, pos in enumerate(sector_6_positions):
+        rod = sim.add_volume("Tubs", f"{phantom_body.name}_tubs_6_rod_{i}")
+        rod.material = "G4_WATER"
+        rod.mother = phantom_body.name
+        rod.rmin = 0 * mm
+        rod.rmax = 5.0 * mm * scale_factor
+        rod.dz = ROD_LENGTH * scale_factor
+        rod.color = yellow
+        rod.translation = pos
+
     return phantom_body
 
 
 def add_sources(sim, derenzo_phantom, activity_Bq_mL, particle="e+", energy=511):
     """
-    The source is attached to the tubs volumes of the derenzo,
-    it means its coordinate system is the same
-    activity_Bq_mL should contain the activity concentration for each set of tubs (6)
-    """
+    Add radioactive sources to the Derenzo phantom rods.
 
+    This version works with explicitly created volumes (no repetitions).
+
+    Args:
+        sim: OpenGATE simulation object
+        derenzo_phantom: Phantom body volume returned by add_derenzo_phantom()
+        activity_Bq_mL: List of 6 activity concentrations (Bq/mL) for each sector
+        particle: Particle type (default "e+")
+        energy: Particle energy in keV (default 511)
+
+    Returns:
+        List of source objects
+    """
     sources = []
-    for nb_tub in range(1, 7):
-        tubs = sim.volume_manager.volumes[f"{derenzo_phantom.name}_tubs_{nb_tub}"]
-        for i in range(len(tubs.translation)):
-            tub_name = tubs.get_repetition_name_from_index(i)
-            s = tubs.solid_info
-            source = sim.add_source(
-                "GenericSource", f"{derenzo_phantom.name}_tubs_{nb_tub}_source_{i}"
-            )
-            source.attached_to = tub_name
+
+    # Number of rods in each sector
+    rods_per_sector = [3, 6, 10, 10, 10, 15]
+
+    for sector_idx in range(6):
+        sector_num = sector_idx + 1
+        num_rods = rods_per_sector[sector_idx]
+
+        for rod_idx in range(num_rods):
+            # Get the rod volume
+            rod_name = f"{derenzo_phantom.name}_tubs_{sector_num}_rod_{rod_idx}"
+            rod = sim.volume_manager.volumes[rod_name]
+
+            # Create source for this rod
+            source = sim.add_source("GenericSource", f"{rod_name}_source")
+            source.attached_to = rod_name
             source.particle = particle
             source.energy.mono = energy * keV
-            source.activity = activity_Bq_mL[nb_tub - 1] * s.cubic_volume
+
+            # Calculate activity based on rod volume
+            source.activity = activity_Bq_mL[sector_idx] * rod.solid_info.cubic_volume
+
+            # Configure source geometry
             source.position.type = "cylinder"
-            source.position.radius = tubs.rmax
-            source.position.dz = tubs.dz
+            source.position.radius = rod.rmax
+            source.position.dz = rod.dz
             source.direction.type = "iso"
+
             sources.append(source)
 
     return sources
