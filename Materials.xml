@@ -21,6 +21,7 @@
 
   <material name="GAGG">
     <propertiestable>
+    <!-- FIXME: This need to be updated -->
       <property name="SCINTILLATIONYIELD" value="26000" unit="1/MeV"/>
       <property name="RESOLUTIONSCALE" value="4.41"/>
       <property name="SCINTILLATIONTIMECONSTANT1" value="40" unit="ns"/>

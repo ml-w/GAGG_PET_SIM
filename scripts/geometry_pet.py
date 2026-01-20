@@ -1,3 +1,5 @@
+from logging.handlers import WatchedFileHandler
+from turtle import down
 import opengate as gate
 from opengate.contrib.pet import *
 
@@ -18,12 +20,13 @@ from phantom_derenzo import add_derenzo_phantom, add_sources as derenzo_add_sour
 import pathlib
 from pathlib import Path
 
-# Import detector ID parsing utilities
+# Import detector ID parsing utilizties
 from utils import (
     parse_volume_ids,
     crystal_id_to_xy,
     add_detector_ids_to_coincidences,
-    add_detector_ids_to_reads
+    add_detector_ids_to_reads,
+    print_uproot_tree
 )
 
 
@@ -51,7 +54,7 @@ FOV_RADIUS = 10 * cm
 # DETECTOR
 CRYSTAL_SIZE_X = 2 * mm
 CRYSTAL_SIZE_Y = 2 * mm
-CRYSTAL_THICKNESS = 19 * mm
+CRYSTAL_THICKNESS = 20 * mm
 DETECTOR_SPACING = 0.1 * mm
 
 
@@ -67,7 +70,7 @@ def add_materials(sim):
         pass
 
 class PETGeometry():
-    def __init__(self, sim: gate.Simulation, output_file: str, debug: bool=False, gen_attenuation_img: bool=False):
+    def __init__(self, sim: gate.Simulation, output_file: str, debug: bool=False, gen_attenuation_img: bool=False, crystal="GAGG"):
         self._sim = sim
         # pixelized crystal
         if debug:
@@ -93,6 +96,7 @@ class PETGeometry():
         # References to created objects
         self._phantom = None
         self._sources = []
+        self._crystal = crystal
         
         self._gen_attenuation_img = gen_attenuation_img
         
@@ -166,7 +170,7 @@ class PETGeometry():
         trans = get_grid_repetition(
             [1, self._nx, self._ny], [0, CRYSTAL_SIZE_X + DETECTOR_SPACING, CRYSTAL_SIZE_Y + DETECTOR_SPACING]
         )
-        pixelized_crystals.material = "LYSO"
+        pixelized_crystals.material = "GAGG"
         pixelized_crystals.color = [0, 1, 0, 0.3]  # green
         pixelized_crystals.translation = trans
         print(f"Crystal configuration: {self._nx} x {self._ny} y, totally repeated for {pixelized_crystals.number_of_repetitions}")
@@ -334,7 +338,7 @@ class PETGeometry():
         # Handing filenames
         p = Path(self._output_filename)
 
-        # Hits collection actor - attached to crystals with authorization for repeated volumes
+        # STAGE 1: Hits collection actor - collect energy deposits in crystals
         hc = sim.add_actor("DigitizerHitsCollectionActor", "Hits")
         hc.attached_to = self._crystals.name
         hc.authorize_repeated_volumes = True
@@ -349,57 +353,58 @@ class PETGeometry():
             "TrackVertexPosition",       # Source position for tracking
         ]
 
-        # Energy filter - accepts photopeak window
-        energy_filter = sim.add_actor("DigitizerEnergyWindowsActor", "EnergyFilter")
-        energy_filter.attached_to = hc.attached_to
-        energy_filter.authorize_repeated_volumes = True
-        energy_filter.input_digi_collection = hc.name
-        energy_filter.channels = [
-            {"min": 480 * keV, "max": 550 * keV, "name": "scatter"}  # 511 keV photopeak
-        ]
-
-        # Readout actor - groups hits by panel, discretizes by crystal
+        # STAGE 2: Readout actor - group hits by panel, discretize by crystal
         sc = sim.add_actor("DigitizerReadoutActor", "Reads")
-        sc.authorize_repeated_volumes = True
         sc.attached_to = self._crystals.name
-        sc.input_digi_collection = hc.name
+        sc.authorize_repeated_volumes = True
+        sc.input_digi_collection = hc.name  # Input from Hits
         sc.group_volume = self._panel.name  # Group by panel repetitions
         sc.discretize_volume = self._crystals.name  # Discretize to crystal level
         sc.policy = "EnergyWeightedCentroidPosition"
         sc.output_filename = self._output_filename
 
-        # * No need for energy resolution for calibration
+        # For calibration mode, skip blurring and energy windowing
         if calibration_mode:
             print("\n[INFO] Digitizer configured in CALIBRATION MODE")
+            print("  - Chain: Hits → Readout")
             print("  - Blurring: DISABLED")
             print("  - Energy Window: DISABLED")
-            print("  - Output: Raw geometric centers from Readout")            
+            print("  - Output: Raw geometric centers from Readout")
+            print(f"  Output file: {sc.output_filename}")
             return hc, sc
 
-        # * Energy Blurring Actor (Simulation of Energy Resolution)
+        # STAGE 3: Energy Blurring Actor - simulate energy resolution
         blur = sim.add_actor("DigitizerBlurringActor", "Blurred")
         blur.authorize_repeated_volumes = True
         blur.attached_to = self._crystals.name
-        blur.input_digi_collection = sc.name  # Input comes from Readout (sc)
+        blur.input_digi_collection = sc.name  # Input from Readout
         blur.blur_attribute = "TotalEnergyDeposit"
         blur.blur_method = "Gaussian"
-        blur.blur_sigma = 3 * keV
-        if 'GAGG': # NEED CHANGE:
-            blur.blur_resolution = 0.06
-        elif 'LYSO':
-            blur.blur_resolution = 0.12 
+        if self._crystal == 'GAGG':  
+            blur.blur_fwhm = 0.06  # 6% at 511 keV
+        elif self._crystal == 'LYSO':
+            blur.blur_fwhm = 0.12  # 12% at 511 keV
         blur.blur_reference_value = 511 * keV
         blur.output_filename = hc.output_filename
-        
-        # -------------------------------------------------------------
+
+        # STAGE 4: Energy window filter - accept 480-550 keV photopeak
+        energy_filter = sim.add_actor("DigitizerEnergyWindowsActor", "EnergyFilter")
+        energy_filter.attached_to = self._crystals.name
+        energy_filter.authorize_repeated_volumes = True
+        energy_filter.input_digi_collection = blur.name  # Input from Blurred
+        energy_filter.channels = [
+            {"min": 480 * keV, "max": 540 * keV, "name": "photopeak"}  # 511 keV ± 15 keV
+        ]
+        energy_filter.output_filename = hc.output_filename
 
         print(f"\nDigitizer chain configured:")
         print(f"  Stage 1: Hits collection (attached to {self._crystals.name})")
-        print(f"  Stage 2: Readout (group by {sc.group_volume} → rsectorID, discretize by {sc.discretize_volume} → crystalID)")
-        print(f"  Stage 3: Energy window (480-550 keV photopeak)")
-        print(f"  Output: {hc.output_filename}")
+        print(f"  Stage 2: Readout (group by {sc.group_volume}, discretize by {sc.discretize_volume})")
+        print(f"  Stage 3: Energy blurring (resolution: {blur.blur_resolution:.1%} at {blur.blur_reference_value/keV:.0f} keV)")
+        print(f"  Stage 4: Energy window (480-550 keV photopeak)")
+        print(f"  Output: {energy_filter.output_filename}")
 
-        return hc, sc
+        return hc, energy_filter  # Return hits and final output actor
         
     def add_pet(self):
         self._build_detector()
@@ -671,7 +676,7 @@ class PETGeometry():
         self._sources.append(source)
         return source
 
-    def add_point_source(self, position=[0, 0, 0], activity=1 * MBq, isotope="F18"):
+    def add_point_source(self, position=[0, 0, 0], activity=1 * MBq, isotope="F18", name="Point_Source") -> SourceBase:
         """
         Add point source for calibration or testing.
 
@@ -685,18 +690,18 @@ class PETGeometry():
         """
         sim = self._sim
 
-        source = sim.add_source("GenericSource", "Point_Source")
+        source = sim.add_source("GenericSource", name)
         source.particle = "e+"
 
         if isotope == "F18":
             source.energy.type = "F18"
-            source.half_life = 109.77 * 60
+            source.half_life = 109.77 * 60 * sec
         elif isotope == "C11":
             source.energy.type = "C11"
-            source.half_life = 20.38 * 60
+            source.half_life = 20.38 * 60 * sec
         elif isotope == "Ga68":
             source.energy.type = "Ga68"
-            source.half_life = 67.71 * 60
+            source.half_life = 67.71 * 60 * sec
         else:
             source.energy.type = "mono"
             source.energy.mono = 511 * keV
@@ -738,18 +743,26 @@ class PETGeometry():
         
 
 @click.command()
-@click.option('--visu', is_flag=True, help="Turn on visualization. This turns off multi-thread and reduce sim time.", 
-              default=False)
-@click.option('--sim-time', type=float, help="Seconds to simulate. Default to 0.0001 sec", 
-              default=0.0001)
+@click.option('--visu', is_flag=True, default=False,
+              help="Turn on visualization. This turns off multi-thread and reduce sim time.")
+@click.option('--sim-time', type=float, default=0.0001, 
+              help="Seconds to simulate. Default to 0.0001 sec", )
 @click.option('-t', '--time-slices', type=str, default='[0]',
               help="Time slices as a comma-separated list, e.g., '[0,1,2,3]' or '0,1,2,3'")
-@click.option('--output', type=click.Path(dir_okay=False, writable=True, path_type=Path), help="Output file directory.", default="./output/events.root")
-@click.option('--scenario', type=click.Choice(['NEMA', 'Derenzo', 'Ring', 'Point', 'Calibration'], case_sensitive=False), 
+@click.option('--output', type=click.Path(dir_okay=False, writable=True, path_type=Path), help="Output file directory.",
+              default="./output/events.root")
+@click.option('--scenario', type=click.Choice(['NEMA', 'Derenzo', 'Ring', 'Point', 'DualPoints','Calibration'], 
+                                              case_sensitive=False), 
               help="Simulation scenario to run. Default to 'Ring'.", default="Ring")
-@click.option('-n', '--num-thread', type=int, help="Number of threads to use. Default to 1", default=32)
-@click.option('--gen-attenuation-img', is_flag=True, help="If true, save the source attention image to the same output specified with suffix .mhd")
-def main(visu, sim_time, time_slices, output, scenario, num_thread, gen_attenuation_img):
+@click.option('-n', '--num-thread', type=int, default=32, 
+              help="Number of threads to use. Default to 1")
+@click.option('--gen-attenuation-img', is_flag=True, 
+              help="If true, save the source attention image to the same output specified with suffix .mhd")
+@click.option('--scenario-params', type=str, default="",
+              help="Added parameters for setting up sources.")
+@click.option('--lyso', is_flag=True, 
+              help="If true, use LYSO crystals instead of GAGG.")
+def main(visu, sim_time, time_slices, output, scenario, num_thread, gen_attenuation_img, scenario_params, lyso):
     """
     Example usage scenarios for PET simulation.
 
@@ -758,6 +771,15 @@ def main(visu, sim_time, time_slices, output, scenario, num_thread, gen_attenuat
     2. Derenzo Phantom for spatial resolution testing
     3. Ring source configuration (for rotating detector simulation)
     4. Point source for calibration+
+    
+    Usage:
+    
+    Scenario Parameters
+    -------------------
+        Dualpoints:
+            [dx, dy, dz] (list of float) - Provide this to control the symmetrical distance between the two sources.
+            They are provided as mm. 
+        
     """
 
     # * Verify input
@@ -765,6 +787,7 @@ def main(visu, sim_time, time_slices, output, scenario, num_thread, gen_attenuat
     if not re.match(r'[\[\(][0-9, ]*[\]\)]', time_slices):
         raise ValueError("Cannot parse time slices, please input a list of int or tuple or int.")
     time_slices = ast.literal_eval(f"{time_slices}")
+    
     # Automatic rename
     _sim_time = sim_time * sec
     simtime_unit = 's' if _sim_time >= sec else 'ms' if _sim_time >= ms else 'us' if _sim_time >= us else 'ps'
@@ -774,6 +797,9 @@ def main(visu, sim_time, time_slices, output, scenario, num_thread, gen_attenuat
                 else f"{_sim_time:.0f}ps"
     output = output.with_stem(output.stem + f'_{"-".join([str(s) for s in time_slices])}' + f'_{simtime_suffix}')
     print(f"Automatically renamed output: {str(output)}")
+
+    if visu:
+        num_thread = 1
 
     # ==========================================================================
     # SCENARIO 1: NEMA IQ Phantom (Image Quality Assessment)
@@ -788,7 +814,7 @@ def main(visu, sim_time, time_slices, output, scenario, num_thread, gen_attenuat
     sim.world.color = [1, 0, 1, 1]  # invisible
 
     # Create PET geometry
-    pet = PETGeometry(sim, str(output), debug=False, gen_attenuation_img=gen_attenuation_img)  # Set debug=True for faster 5x5 array
+    pet = PETGeometry(sim, str(output), debug=False, gen_attenuation_img=gen_attenuation_img, crystal="LYSO" if lyso else "GAGG")  # Set debug=True for faster 5x5 array
     pet.add_pet()
     pet.add_digitizer(calibration_mode=scenario == 'Calibration')
 
@@ -829,9 +855,28 @@ def main(visu, sim_time, time_slices, output, scenario, num_thread, gen_attenuat
     elif scenario == "Point":
         # Point source for calibration
         print("Creating point source...")
-        source = pet.add_point_source(position=[0, 0, 0], activity=1 * MBq / num_thread, isotope="F18")
+        source = pet.add_point_source(position=[0, 0, 0], activity=240 * MBq / num_thread, isotope="F18")
         print(f"  - Position: center")
         print(f"  - Activity: 1 MBq F-18")
+    elif scenario == "DualPoints":
+        # Point source for calibration
+        print("Creating dual point source...")
+        if re.match(r'\[[\d\.]+,[\d\.]+,[\d\.]+\]', scenario_params):
+            dx, dy, dz = [float(x) * mm for x in re.findall(r'\d+\.?\d*', scenario_params)]
+        else:
+            dx, dy, dz = 1.0 * cm, 0 * cm, 0 * cm
+        # Water sphere
+        water_sphere = sim.add_volume("SphereVolume", "Water_Sphere")
+        water_sphere.mother = sim.world.name
+        water_sphere.material = "G4_WATER"
+        water_sphere.rmax = (np.sqrt((dx/2)**2 + (dy/2)**2 + (dz/2)**2) * 1.3) # covering both source
+        water_sphere.color = [0, 0, 1, 1]  # blue
+
+        source1 = pet.add_point_source(position=[-dx/2, -dy/2, -dz/2], activity=240 * MBq / num_thread, isotope="F18", name="Source1")
+        source2 = pet.add_point_source(position=[+dx/2, +dy/2, +dz/2], activity=240 * MBq / num_thread, isotope="F18", name="Source2")
+        print(f"  - Positions: [{-dx/2}, {-dy/2}, {-dz/2}] and [{+dx/2}, {+dy/2}, {+dz/2}]")
+        print(f"  - Activity: 1 MBq F-18 each")
+        
     elif scenario == "Calibration":
         print("Creating Geometry Calibration setup...")
         pet.add_calibration_source()
@@ -844,12 +889,83 @@ def main(visu, sim_time, time_slices, output, scenario, num_thread, gen_attenuat
     # Save phantom to attenuation images
     # ==================================
     if gen_attenuation_img:
-        print(f"  Saving phantom...")
+        print(f"\n[ATTENUATION IMAGE GENERATION]")
+        print(f"  Voxelizing phantom geometry...")
         fname = Path(output).with_suffix(".mhd")
-        volume_labels, image = sim.voxelize_geometry(extent=phantom, spacing=(1, 1, 1), filename=str(fname))
-        # verify saved
-        if fname.is_file():
-            print(f"  Phantom saved to: {str(fname)}")
+        fname_imfile = fname.with_stem(fname.stem + "_image")
+
+        # Voxelize the phantom geometry
+        volume_labels, image = sim.voxelize_geometry(
+            extent=phantom,
+            spacing=(1, 1, 1),  # 1mm voxel spacing
+            filename=str(fname)
+        )
+
+        # Verify voxelized geometry was saved
+        if fname_imfile.is_file():
+            print(f"  ✓ Voxelized phantom saved to: {str(fname)}")
+        else:
+            raise FileNotFoundError(f"  ✗ Failed to save voxelized phantom")
+
+        # Clean up existing simulation configuration
+        print(f"  Resetting simulation for attenuation calculation...")
+        sim.close()
+        del sim
+        sim = gate.Simulation() # Creates a new sim instance
+
+        # Basic simulation configuration
+        add_materials(sim)
+        sim.check_volumes_overlap = True
+        sim.world.size = [WORLD_RADIUS * 2, WORLD_RADIUS * 2, WORLD_DEPTH]
+        sim.world.material = "G4_AIR"
+        sim.world.color = [1, 0, 1, 1]  # invisible
+
+
+        # Prepare new voxelized phantom volume for attenuation calculation
+        print(f"  Creating voxelized phantom volume...")
+        vox_phantom = sim.add_volume("Image", "VoxelizedPhantom")
+        vox_phantom.image = str(fname_imfile)  # Load the voxelized geometry
+        vox_phantom.material = "G4_AIR"  # Default material (will be overridden by voxel data)
+        vox_phantom.mother = sim.world.name
+
+        # Load labels
+        print(f"  Loading volume labels for attenuation mapping...")
+        import json
+
+        def labels_to_ranges(labels_dict):
+            """Convert label dict to material ranges [[label, label+1, material], ...]"""
+            ranges = [[info["label"], info["label"] + 1, info["material"]]
+                      for info in labels_dict.values()]
+            return sorted(ranges, key=lambda x: x[0])
+
+        label_file = fname.with_stem(fname.stem + "_labels").with_suffix(".json")
+        with open(label_file, 'r') as f:
+            label_dict = json.load(f)
+
+        vox_phantom.voxel_materials = labels_to_ranges(label_dict)
+
+
+        print(f"  Adding attenuation calculation actor...")
+        mumap = sim.add_actor("AttenuationImageActor", "AttenuationMap")
+        mumap.image_volume = vox_phantom
+        mumap.output_filename = str(output.with_stem(output.stem + '_mumap').with_suffix('.nii.gz'))
+        mumap.energy = 511.0 * keV  # 511 keV for PET photons
+        mumap.database = "NIST"
+        mumap.attenuation_image.write_to_disk = True
+        mumap.attenuation_image.active = True
+
+        print(f"  Running attenuation calculation...")
+        print(f"  Energy: 511 keV")
+        print(f"  Output: {mumap.output_filename}")
+
+        # Run simulation (no particles needed, just calculate attenuation from geometry)
+        sim.run()
+        sim.close()
+
+        print(f"\n✓ Attenuation image generation complete!")
+        print(f"  Voxelized phantom: {fname}")
+        print(f"  Attenuation map: {mumap.output_filename}")
+        return 
 
     # Simulation parameters
     sim.number_of_threads = num_thread
@@ -870,75 +986,204 @@ def main(visu, sim_time, time_slices, output, scenario, num_thread, gen_attenuat
         # sim.run_timing_intervals = [(0, .000001 * sec)]
         if scenario == "Derenzo":
             sim.run_timing_intervals = [(0, .00000001 * sec)]
-    
+        elif scenario == "DualPoints":
+            sim.run_timing_intervals = [(0, 1E-6 * sec)]
+
     print("\nStarting simulation...")
     print("Close visualization window to end.")
     sim.run()
     sim.close()
     print("Simulation complete!")
-    
-    # === CALIBRATION POST-PROCESSING ===
-    if scenario == "Calibration":
-        with uproot.open(pet._output_filename) as f:
-            print(f"Reading ROOT file: {pet._output_filename}")
-
-            # Get all tree names in the file
-            tree_names = [key for key in f.keys() if f[key].classname.startswith('TTree')]
-            print(f"Found {len(tree_names)} tree(s) in file: {tree_names}")
-        pet.generate_lut()
-        return # Skip coincidence processing for calibration
-    # ===================================
-    
-    # Calculating the coincidences
-    print("\nProcessing coincidences...")
-
-    with uproot.open(pet._output_filename) as f:
-        print(f"Reading ROOT file: {pet._output_filename}")
-
-        # # Process coincidences from the Reads tree
-        print("  Processing coincidences...")
-        coincidences = coincidences_sorter(f['Reads'],
-                                           3 * gate.g4_units.nanosecond,
-                                           "takeAllGoods",
-                                           0.5 * gate.g4_units.mm,
-                                           "xy",
-                                           0.5 * gate.g4_units.mm,
-                                           chunk_size=100000,
-                                           return_type="dict"
-                                           )
-
-        # Add rsectorID, moduleID, submoduleID, and crystalID to coincidences
-        # This is needed as coincidences_sorter reads from f['Reads'] (file)
-        # which hasn't been modified with the detector IDs yet (those are in all_trees dict)
-        coincidences = add_detector_ids_to_coincidences(coincidences, verbose=True)
-
-
-    print(f"Found {len(coincidences[list(coincidences.keys())[0]])} coincidence events")
-
-    # * Output to different file
-    p = Path(pet._output_filename)
-    coincidences_root = p.with_stem(p.stem + "_coincidence")
-    try:
-        with uproot.create(str(coincidences_root)) as f:
-            f["Coincidences"] = coincidences
-    except FileExistsError:
-        print(f"⚠️[WARNING]: Output file exist, rewriting...")
-        with uproot.recreate(str(coincidences_root)) as f:
-            f["Coincidences"] = coincidences
-    print(f"Saved the Coincidences")
-
-    coincidence_id_branches = [k for k in sorted(coincidences.keys()) if 'rsectorID' in k or 'moduleID' in k or 'submoduleID' in k or 'crystalID' in k]
-    if coincidence_id_branches:
-        print(f"  ID branches: {', '.join(coincidence_id_branches)}")
-    for key in sorted(coincidences.keys())[:10]:  # Show first 10 branches
-        print(f"  - {key}")
-    if len(coincidences) > 10:
-        print(f"  ... and {len(coincidences) - 10} more branches")
-
+    print("↪ Run process_coincidences next to obtain LORs.")
     
     # Saving the config
     pet.save_geom()
     
     
+@click.command()
+@click.argument('input_files', nargs=-1, type=click.Path(exists=True, dir_okay=False, path_type=Path), required=True)
+@click.option('--time-window', type=float, default=3.0,
+              help="Coincidence time window in nanoseconds (default: 3.0 ns)")
+@click.option('--policy', type=str, default='takeWinnerOfGoods',
+              help="Coincidence policy: takeAllGoods, takeWinnerOfGoods, etc. See https://opengate.readthedocs."
+                   "io/en/latest/digitizer_and_detector_modeling.html#id44 for more details. (default: "
+                   "takeWinnerOfGoods)")
+@click.option('--min-sector-diff', type=int, default=0,
+              help="Minimum sector difference for valid coincidences (default: 0). FIXME: Not implemented yet.")
+@click.option('--min-transaxial-distance', type=float, default=None,
+              help="Minimum transaxial distance for valid coincidences in mm (default: FOV diameter = 200.0)")
+@click.option('--max-axial-distance', type=float, default=100,
+              help="Maximum axial distance for valid coincidences in mm (default: 100 mm ~ panel width/height)")
+@click.option('--chunk-size', type=int, default=100000,
+              help="Processing chunk size for memory efficiency (default: 100000)")
+@click.option('--lyso', is_flag=True, default=False,
+              help="If set, use LYSO crystal properties for coincidence sorting.")
+@click.option('--tree-name', '-s', type=str, default='Reads',
+              help="Name of the tree in the ROOT file to process (default: 'Reads')")
+def process_coincidences(input_files, time_window, policy, min_sector_diff, min_transaxial_distance, max_axial_distance, chunk_size, lyso, tree_name):
+    """
+    Process coincidences from one or more GATE simulation ROOT files.
+
+    Reads the 'Reads' tree from ROOT file(s), applies coincidence sorting,
+    adds detector IDs, and saves to a new ROOT file with '_coincidence' suffix.
+
+    INPUT_FILES: One or more paths to ROOT files containing simulation data
+
+    Example:
+        python geometry_pet.py process-coincidences output/events.root
+        python geometry_pet.py process-coincidences output/events_*.root --time-window 5.0
+        python geometry_pet.py process-coincidences file1.root file2.root file3.root
+    """
+    # Set default for min_transaxial_distance if not provided
+    if min_transaxial_distance is None:
+        min_transaxial_distance = FOV_RADIUS * 2.0  # FOV diameter (200 mm for 10 cm FOV radius)
+
+    # Print global settings
+    print(f"\n{'='*60}")
+    print(f"COINCIDENCE PROCESSING - BATCH MODE")
+    print(f"{'='*60}")
+    print(f"Number of files: {len(input_files)}")
+    print(f"Time window: {time_window} ns")
+    print(f"Policy: {policy}")
+    print(f"Min sector difference: {min_sector_diff}")
+    print(f"Min transaxial distance: {min_transaxial_distance} mm")
+    print(f"Max axial distance: {max_axial_distance} mm")
+    print(f"Chunk size: {chunk_size}")
+    print(f"{'='*60}\n")
+
+    # Accumulate all coincidences from all files
+    all_coincidences = None
+    total_events = 0
+    processed_files = 0
+
+    # Process each file
+    for file_idx, input_file in enumerate(input_files, 1):
+        print(f"\n{'='*60}")
+        print(f"PROCESSING FILE {file_idx}/{len(input_files)}: {input_file.name}")
+        print(f"{'='*60}")
+
+        # Verify file exists and contains expected tree
+        print_uproot_tree(input_file)
+        with uproot.open(input_file) as f:
+            tree_names = [key for key in f.keys() if f[key].classname.startswith('TTree')]
+            print(f"Found {len(tree_names)} tree(s) in file: {tree_names}")
+
+            if tree_name not in f:
+                print(f"⚠️  WARNING: Input file does not contain '{tree_name}' tree. Skipping.")
+                print(f"   Available trees: {tree_names}")
+                continue
+
+            # for LYSO, we need extra steps to simulate lower yield
+            if lyso:
+                from rootfiles_handlers import downsample_root_tree
+                rich.print("  ⬇️ Downsampling Reads tree for LYSO crystal properties...")     
+                downsample_root_tree(input_file, tree_name, "_tempfile.root", fraction=1/3.)
+                input_file = "_tempfile.root"
+
+        with uproot.open(input_file) as f: # open again in case it changes
+            # Process coincidences from the Reads tree
+            print("\nProcessing coincidences...")
+            coincidences = coincidences_sorter(
+                f[tree_name],
+                time_window * gate.g4_units.nanosecond,
+                policy,
+                min_transaxial_distance, # min transaxial distance (in mm)
+                "xy",
+                max_axial_distance * gate.g4_units.mm, # max axial differences
+                chunk_size=chunk_size,
+                return_type="dict"
+            )
+
+            # Add rsectorID, moduleID, submoduleID, and crystalID to coincidences
+            print("  Adding detector IDs to coincidences...")
+            coincidences = add_detector_ids_to_coincidences(coincidences, verbose=True)
+
+        num_events = len(coincidences[list(coincidences.keys())[0]])
+        print(f"\nFound {num_events} coincidence events from this file")
+        total_events += num_events
+        processed_files += 1
+
+        # Accumulate coincidences
+        if all_coincidences is None:
+            # First file - initialize the combined dictionary
+            all_coincidences = coincidences
+        else:
+            # Subsequent files - concatenate arrays
+            for key in coincidences.keys():
+                all_coincidences[key] = np.concatenate([all_coincidences[key], coincidences[key]])
+
+        print(f"✓ File processed. Total accumulated events: {total_events}")
+
+    # Check if any files were processed
+    if processed_files == 0:
+        print("\n⚠️  No valid files were processed!")
+        return
+
+    # Determine output filename based on input files
+    if len(input_files) == 1:
+        # Single file - use same naming convention
+        output_file = input_files[0].with_stem(input_files[0].stem + "_coincidence")
+    else:
+        # Multiple files - create a combined output name
+        # Use the directory of the first file and create a combined name
+        first_file = input_files[0]
+        output_file = first_file.parent / "combined_coincidence.root"
+
+    # Save all coincidences to a single file
+    print(f"\n{'='*60}")
+    print(f"SAVING COMBINED RESULTS")
+    print(f"{'='*60}")
+    print(f"Total coincidence events: {total_events}")
+    print(f"Output file: {output_file}")
+
+    try:
+        with uproot.create(str(output_file)) as f:
+            f["Coincidences"] = all_coincidences
+        print(f"✓ Created new file: {output_file}")
+    except FileExistsError:
+        print(f"⚠️  Output file exists, overwriting: {output_file}")
+        with uproot.recreate(str(output_file)) as f:
+            f["Coincidences"] = all_coincidences
+
+    # Display summary
+    coincidence_id_branches = [k for k in sorted(all_coincidences.keys())
+                               if 'rsectorID' in k or 'moduleID' in k or
+                                  'submoduleID' in k or 'crystalID' in k]
+    if coincidence_id_branches:
+        print(f"ID branches: {', '.join(coincidence_id_branches)}")
+
+    print(f"\nFirst 10 branches:")
+    for key in sorted(all_coincidences.keys())[:10]:
+        print(f"  - {key}")
+    if len(all_coincidences) > 10:
+        print(f"  ... and {len(all_coincidences) - 10} more branches")
+
+    # Final summary
+    print(f"\n{'='*60}")
+    print(f"BATCH PROCESSING COMPLETE")
+    print(f"{'='*60}")
+    print(f"Processed {processed_files}/{len(input_files)} file(s)")
+    print(f"Total coincidence events: {total_events}")
+    print(f"Output file: {output_file}")
+    print(f"{'='*60}\n")
+
+
+@click.group()
+def cli():
+    """4
+    GATE PET Simulation and Analysis Tools
+
+    Available commands:
+    - simulate: Run GATE PET simulation with various scenarios
+    - process-coincidences: Process coincidences from existing ROOT files
+    """
+    pass
+
+
+# Register commands
+cli.add_command(main, name='simulate')
+cli.add_command(process_coincidences, name='process_coincidences')
+
+
 if __name__ == "__main__":
-    main()
+    cli()

@@ -26,7 +26,9 @@ def add_derenzo_phantom(sim, name="derenzo", scale_factor=1.0):
     """
     Add a Derenzo phantom with 6 sets of cylinders of different sizes.
     Each cylinder is created as an individual volume for voxelization compatibility.
-    
+
+    Phantom housing is a cylindrical Tubs (tube) geometry filled with PMMA.
+
     Aware that using translation list vectors also works for the simulation, but it prevents
     the phantom to be saved. That's why we are using for loop to create this phantom.
 
@@ -39,17 +41,31 @@ def add_derenzo_phantom(sim, name="derenzo", scale_factor=1.0):
         phantom_body: The main phantom volume object
     """
     # Configs
-    PHANTOM_THICKNESS = 8 * cm
+    PHANTOM_DIAMETER = 28 * cm  # Outer diameter of cylindrical phantom
+    PHANTOM_THICKNESS = 8 * cm  # Axial extent
     ROD_LENGTH = (PHANTOM_THICKNESS - 2 * cm)/2.
+
+    # FOV
+    FOV = sim.add_volume("Box", "FOV")
+    FOV.size = [30 * cm * scale_factor, 30 * cm * scale_factor, PHANTOM_THICKNESS * scale_factor]
+    FOV.mother = "world"
+    FOV.material = "G4_AIR"
+    FOV.color = [0, 1, 0, 0.1]  # Semi-transparent green
     
-    # Create phantom body (air-filled box)
-    phantom_body = sim.add_volume("Box", name)
-    phantom_body.size = [30 * cm * scale_factor, 30 * cm * scale_factor, PHANTOM_THICKNESS * scale_factor] # 1 cm covers
-    phantom_body.mother = "world"
-    phantom_body.material = "G4_WATER"
+    # Create phantom body (PMMA-filled cylindrical tube)
+    phantom_body = sim.add_volume("Tubs", name)
+    phantom_body.rmin = 0 * mm  # Solid cylinder (not hollow)
+    phantom_body.rmax = PHANTOM_DIAMETER / 2 * scale_factor
+    phantom_body.dz = PHANTOM_THICKNESS / 2 * scale_factor  # Half-length in GATE
+    phantom_body.mother = FOV.name
+    phantom_body.material = "PMMA"
+
+    # Rotate to align with typical PET scanner orientation
+    # Phantom axis along Z, rods oriented axially
     rot = R.from_euler("x", [-90], degrees=True)
     phantom_body.rotation = rot.as_matrix()
     yellow = [1, 1, 0, 0.5]
+
 
     # Sector 1: 14.5 mm diameter rods (3 rods)
     sector_1_positions = [
