@@ -57,6 +57,10 @@ CRYSTAL_SIZE_Y = 2 * mm
 CRYSTAL_THICKNESS = 20 * mm
 DETECTOR_SPACING = 0.1 * mm
 
+# COLIMATOR, Add by Xiaoyu
+COLIMATOR_THICKNESS = 9.0 * mm  # THICKNESS of the COLIMATOR
+COLIMATOR_SPACING = 0.1 * mm    # SPACE between crystal and COLIMATOR
+COLIMATOR_MATERIAL = "G4_Pb"    # MATERIAL of the COLIMATOR
 
 def add_materials(sim):
     # Use local GateMaterials.db if available, otherwise standard
@@ -82,9 +86,12 @@ class PETGeometry():
         
         # Number of panels (rsectors) arranged circularly. This needs to consider FOV
         self._n_rsectors = 8
+
+        # start angle of the setup, Add by Xiaoyu
+        self._start_angle = 40
         
         self._housing_size = [
-            CRYSTAL_THICKNESS,
+            CRYSTAL_THICKNESS + 2 * (COLIMATOR_THICKNESS + COLIMATOR_SPACING), # to include COLIMATOR, Add by Xiaoyu
             self._nx * CRYSTAL_SIZE_X + (self._nx - 1) * DETECTOR_SPACING,
             self._ny * CRYSTAL_SIZE_Y + (self._ny - 1) * DETECTOR_SPACING,
         ]
@@ -155,7 +162,7 @@ class PETGeometry():
         panel.size = self._housing_size
         panel.color = [0.5, 0.5, 0.5, 1]  # grey
         trans, rot = get_circular_repetition(
-            self._n_rsectors, [FOV_RADIUS * 1.4, 0, 0], start_angle_deg = 0, axis=[0, 0, 1]
+            self._n_rsectors, [FOV_RADIUS * 1.46, 0, 0], start_angle_deg = 0, axis=[0, 0, 1]
         )
         panel.translation = trans
         panel.rotation = rot
@@ -165,7 +172,7 @@ class PETGeometry():
         
         # Build the panel with GAGG
         pixelized_crystals = sim.add_volume("Box", "PixelizedCrystals")
-        pixelized_crystals.mother = panel
+        pixelized_crystals.mother = panel.name
         pixelized_crystals.size = [CRYSTAL_THICKNESS, CRYSTAL_SIZE_X, CRYSTAL_SIZE_Y]
         trans = get_grid_repetition(
             [1, self._nx, self._ny], [0, CRYSTAL_SIZE_X + DETECTOR_SPACING, CRYSTAL_SIZE_Y + DETECTOR_SPACING]
@@ -174,6 +181,33 @@ class PETGeometry():
         pixelized_crystals.color = [0, 1, 0, 0.3]  # green
         pixelized_crystals.translation = trans
         print(f"Crystal configuration: {self._nx} x {self._ny} y, totally repeated for {pixelized_crystals.number_of_repetitions}")
+        print(f"Crystal: {self._crystal}")
+
+        # Build lead shield with holds (colimator), Add by Xiaoyu
+        lead_colimator = sim.add_volume("Box", "LeadColimator")
+        lead_colimator.mother = panel.name
+        lead_colimator.size = [COLIMATOR_THICKNESS, self._housing_size[1], self._housing_size[2]]
+        lead_colimator.material = COLIMATOR_MATERIAL
+        lead_colimator.translation = [- CRYSTAL_THICKNESS/2 - COLIMATOR_THICKNESS/2 - COLIMATOR_SPACING, 0, 0]
+        lead_colimator.color = [1.0, 0, 0, 1.0]
+        # Build lead shield holds
+        filtered_trans = [
+            [0, pos[1], pos[2]] 
+            for pos in trans
+            if abs(pos[1]) <= self._housing_size[1]/2 and abs(pos[2]) <= self._housing_size[2]/2
+        ]
+        for i, (x, y, z) in enumerate(filtered_trans):
+            lead_hole = sim.add_volume("Tubs", f"LeadHole_{i:04d}")
+            lead_hole.mother = lead_colimator.name
+            lead_hole.material = "G4_AIR"
+            lead_hole.rmax = (CRYSTAL_SIZE_X + CRYSTAL_SIZE_Y)/4      
+            lead_hole.rmin = 0                
+            lead_hole.dz = COLIMATOR_THICKNESS/2 
+            lead_hole.sphi = 0                
+            lead_hole.dphi = 360 * deg
+            lead_hole.rotation = np.array([[0,0,-1],[0,1,0],[1,0,0]])
+            lead_hole.translation = [x, y, z]
+            lead_hole.color = [0, 0, 1, 0.5]
         
         self._panel = panel
         self._crystals = pixelized_crystals
@@ -714,6 +748,20 @@ class PETGeometry():
         self._sources.append(source)
         return source
 
+    # point gamma source, Add by Xiaoyu
+    def add_gamma_source(self, position=[0, 0, 0], energy=200.0 * keV, activity=1 * MBq, name="Gamma_Source") -> SourceBase:
+        sim = self._sim
+        source = sim.add_source("GenericSource", name)
+        source.particle = "gamma"  
+        source.energy.type = "mono"
+        source.energy.mono = energy
+        source.activity = activity
+        source.position.type = "point"
+        source.position.translation = position
+        source.direction.type = "iso" 
+        self._sources.append(source)
+        return source
+
     # ==========================================================================
     # PHYSICS CONFIGURATION
     # ==========================================================================
@@ -876,6 +924,10 @@ def main(visu, sim_time, time_slices, output, scenario, num_thread, gen_attenuat
         source2 = pet.add_point_source(position=[+dx/2, +dy/2, +dz/2], activity=240 * MBq / num_thread, isotope="F18", name="Source2")
         print(f"  - Positions: [{-dx/2}, {-dy/2}, {-dz/2}] and [{+dx/2}, {+dy/2}, {+dz/2}]")
         print(f"  - Activity: 1 MBq F-18 each")
+
+        # gamma source, Add by Xiaoyu
+        #source1 = pet.add_gamma_source(position=[-dx/2, -dy/2, -dz/2], energy=200 * keV, activity=240 * MBq / num_thread, name="Source1")
+        #source2 = pet.add_gamma_source(position=[+dx/2, +dy/2, +dz/2], energy=200 * keV, activity=240 * MBq / num_thread, name="Source2")
         
     elif scenario == "Calibration":
         print("Creating Geometry Calibration setup...")
