@@ -162,7 +162,7 @@ class PETGeometry():
         panel.size = self._housing_size
         panel.color = [0.5, 0.5, 0.5, 1]  # grey
         trans, rot = get_circular_repetition(
-            self._n_rsectors, [FOV_RADIUS * 1.46, 0, 0], start_angle_deg = 0, axis=[0, 0, 1]
+            self._n_rsectors, [FOV_RADIUS * 1.46, 0, 0], start_angle_deg = self._start_angle, axis=[0, 0, 1]
         )
         panel.translation = trans
         panel.rotation = rot
